@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+venv/
+env/
+.env/
+
+# Data files (large binaries — transfer separately via scp/rsync)
+data/
+
+# Training checkpoints and logs (large .pkl files)
+experiments/
+
+# Generated plots
+plots/*.png
+plots/*.pdf
+
+# Jupyter / editor artifacts
+.ipynb_checkpoints/
+.DS_Store
+*.egg-info/
+dist/
+build/

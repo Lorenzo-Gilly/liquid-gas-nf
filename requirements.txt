@@ -1,0 +1,17 @@
+# Core training dependencies (pinned to match development environment)
+# JAX with CUDA — install separately, see note below
+# pip install "jax[cuda12]==0.8.2"   # for CUDA 12 (most common)
+# pip install "jax[cuda13]==0.8.2"   # for CUDA 13 (if using new drivers)
+jaxlib==0.8.2
+
+dm-haiku==0.0.16
+optax==0.2.6
+numpy==2.4.0
+scipy==1.16.3
+matplotlib==3.10.8
+
+# distrax — install from git (PyPI version is outdated)
+distrax @ git+https://github.com/google-deepmind/distrax.git@0b590e967d707b3a112a9d3b21643a8556650b83
+
+# Optional but used in some experiments
+chex==0.1.91
