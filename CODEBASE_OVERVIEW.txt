@@ -1,0 +1,427 @@
+================================================================================
+CODEBASE OVERVIEW: liquid-gas-nf
+Normalizing Flow for Phase-Space Transfer in 2D Particle Systems
+================================================================================
+
+PURPOSE
+-------
+This codebase trains a normalizing flow to learn a bijective map between two
+Boltzmann distributions of a 2D particle system:
+
+    SOURCE (prior):  WCA fluid   -- purely repulsive liquid, beta=0.5 (T=2)
+    TARGET:          LJ fluid    -- attractive liquid-gas, beta=1.0  (T=1)
+
+WCA (Weeks-Chandler-Andersen) is LJ truncated at r=2^(1/6)*sigma, keeping only
+the repulsive core. LJ (Lennard-Jones) includes both repulsion and the -1/r^6
+attraction. The systems are thermodynamically related, making WCA a natural
+reference distribution for LJ phase-space sampling.
+
+The trained flow enables:
+  1. Free energy estimation between the two phases via importance sampling.
+  2. Drawing unbiased LJ samples by pushing WCA samples through the flow.
+  3. Computing the RESS (relative effective sample size) as a measure of how
+     well the flow overlaps the two distributions.
+
+
+PHYSICAL SYSTEM
+---------------
+  Particles:     N=32, 2D Cartesian coordinates
+  Box:           Square, L=6.6, periodic boundary conditions (PBC)
+                 density rho = N/L^2 = 32/6.6^2 ≈ 0.7346
+  DOF:           (N-1)*D = 31*2 = 62  (one particle fixed at origin)
+  Coordinates:   flat vector of shape (N*D,) = (64,) per sample
+  Energy units:  epsilon=1, sigma=1 (reduced LJ units)
+  WCA cutoff:    r_c = 2^(1/6) * sigma ≈ 1.1225
+  LJ  cutoff:    r_c = 2.5 * sigma (with long-range correction)
+
+Energies are evaluated on batches: input shape (B, N*D), output shape (B,).
+PBC is enforced via minimum image convention: dr -> dr - L*round(dr/L).
+
+
+REPOSITORY STRUCTURE
+--------------------
+
+  train.py              -- CLI entry point; parses args, builds PipelineConfig,
+                           dispatches to jax_pipeline.train()
+
+  config.py             -- All configuration dataclasses (no logic):
+                             SystemConfig  -- N, D, rho, L
+                             EnergyConfig  -- epsilon, sigma, cutoffs, LRC flag
+                             FlowConfig    -- architecture hyperparameters
+                             TrainConfig   -- lr, epochs, batch size, milestones
+                             MCMCConfig    -- step_size, n_samples, n_cached,
+                                             refresh_cycles, equilibration
+                             PipelineConfig -- root config; computes derived
+                                              quantities (batches_per_epoch,
+                                              milestone_steps, n_dof)
+
+  physics.py            -- Pure JAX physics kernels:
+                             lj_energy()        LJ with cutin linearization,
+                                                cutoff, optional 2D/3D LRC
+                             wca_energy()       WCA (LJ truncated at r_WCA)
+                             run_mcmc()         Vectorized Metropolis MC
+                             generate_dataset() Full MCMC protocol
+                             fcc_lattice()      Triangular (2D) / cubic (3D)
+                                                lattice initialization
+                             ress()             Relative effective sample size
+                             octahedral_transform()  Random symmetry augmentation
+                             wrap_pbc(), center_particle()  PBC utilities
+
+  jax_pipeline.py       -- Full training pipeline:
+                             build_flow()          Constructs the flow model
+                             DynamicPrior          Manages WCA MCMC cache
+                             load_or_generate_data()  Data I/O
+                             loss_xz(), loss_zx()  Two-sided training losses
+                             compute_val_metrics() Validation + RESS
+                             augment_batch()       Symmetry augmentation
+                             make_batches()        Epoch shuffling
+                             train()               Main training loop
+
+  lorenzo_models/
+    coupling_flows.py   -- make_split_coupling_flow()    (Lorenzo pattern)
+                           make_correti_coupling_flow()  (Correti pattern)
+                           make_equivariant_conditioner()
+                           make_type_aware_conditioner() (for mixed systems)
+    bijectors.py        -- CircularShift, RemoveOrigin, Rescale (distrax wrappers)
+    attention.py        -- Transformer, SelfAttention, _DenseBlock (haiku modules)
+    embeddings.py       -- circular()  Fourier positional encoding for PBC coords
+    utils.py            -- Parameter helper for haiku
+
+  reference/            -- Original PyTorch reference implementation (Correti et al.)
+                           and notebook utilities. Read-only reference; not imported.
+
+  data/                 -- Generated MCMC datasets (not in git, created on first run)
+    1M/
+      lj_configs.npy    -- (1_000_000, 64) float32 LJ configurations
+      wca_configs.npy   -- (1_000_000, 64) float32 WCA configurations
+
+  experiments/          -- Training output per run (not in git)
+    {model}_{config}/
+      config.json       -- Full serialized PipelineConfig
+      training.log      -- Per-epoch metrics
+      params_epoch_N.pkl -- Haiku parameter checkpoints
+
+
+MCMC DATA GENERATION
+--------------------
+All MCMC runs all N_samples replicas simultaneously as a batch (fully
+vectorized in JAX via jax.lax.scan). This means the GPU handles all replicas
+in parallel; there is no sequential "chain" in the traditional sense.
+
+Data generation protocol (generate_dataset in physics.py):
+  1. Initialize:     N_samples copies of triangular lattice + small noise
+  2. Hot equil:      5000 Metropolis sweeps at 0.2*beta (high temp, rapid mixing)
+  3. Cold equil:     5000 Metropolis sweeps at beta (target temperature)
+  4. Production:     1000 Metropolis sweeps at beta -> save final state
+
+Each Metropolis "sweep" (_metropolis_step):
+  - Picks one random particle per replica (vectorized)
+  - Proposes Gaussian displacement with step_size=0.2
+  - Accepts/rejects via standard Metropolis criterion
+  - Updates only the moved particle; all else unchanged
+  - Wraps new positions under PBC
+
+After generation, datasets are saved as .npy files and reloaded on subsequent
+runs. With 1M samples, the .npy files are ~256 MB each.
+
+Dynamic Prior (DynamicPrior class in jax_pipeline.py):
+  During training, WCA configurations in the batch are NOT simply drawn from
+  the static dataset. Instead, a cache of ~900K WCA configurations is
+  maintained and EVOLVED by running 1000 MCMC steps EACH TRAINING STEP.
+  This keeps the prior distribution "alive" -- the flow sees a continuously
+  evolving WCA distribution rather than a fixed static set. This is key to
+  avoiding distribution shift between the static dataset and what the flow
+  actually needs to model.
+
+  The dynamic prior is the main computational bottleneck (~0.4s per training
+  step on GB10), not the neural network forward/backward pass.
+
+
+FLOW ARCHITECTURE
+-----------------
+The normalizing flow is a sequence of invertible bijections. It maps a
+configuration x ~ p_LJ to z ~ p_WCA (inverse direction) and vice versa
+(forward direction).
+
+Full pipeline (build_flow in jax_pipeline.py):
+
+  x (physical, [-L/2, L/2])
+    -> Rescale to [-1, 1]                           (element-wise affine, no params)
+    -> RemoveOrigin: (N, D) -> (N-1, D)             (pin particle 0 at origin,
+                                                      removes translational DOF)
+    -> Coupling flow on (N-1, D) = (31, 2) space    (all learnable params here)
+    -> AddOrigin: (N-1, D) -> (N, D)                (re-insert zeros for particle 0)
+    -> Rescale back to [-L/2, L/2]
+  = z (latent, same physical units as x)
+
+The RemoveOrigin step is essential: it gauge-fixes translational symmetry by
+pinning particle 0 to the origin. The flow only needs to learn the 62-DOF
+relative configuration, not the absolute position.
+
+Two flow architectures are implemented, selectable via --model flag:
+
+  LORENZO (default):
+    make_split_coupling_flow with num_layers = n_blocks * 2
+    Default: n_blocks=8, total=16 "super-layers"
+    Each super-layer contains:
+      [optional permute] + [optional circular shift] + RQS(swap=True) + RQS(swap=False)
+    Total RQS coupling layers: 16 * 2 = 32
+    Particle permutations: random (drawn at flow construction time, fixed thereafter)
+
+  CORRETI:
+    make_correti_coupling_flow with n_blocks super-blocks
+    Default: n_blocks=8
+    Each super-block contains TWO sub-blocks (a and b):
+      sub-block a: [circular shift] + RQS(swap=True) + RQS(swap=False)
+      sub-block b: [circular shift] + RQS(swap=False) + RQS(swap=True)
+    Total RQS coupling layers: n_blocks * 4 = 32
+    No random particle permutations (relies on circular shifts for mixing)
+
+Both architectures share the same parameter count at default settings (~6.6M).
+
+RATIONAL QUADRATIC SPLINE (RQS) COUPLING LAYER:
+  Each coupling layer splits the (N-1, D) = (31, 2) input along the last axis
+  (the D=2 spatial dimension) at split_index=1:
+    - "swap=False": transform coord 0 conditioned on coord 1
+    - "swap=True":  transform coord 1 conditioned on coord 0
+  The bijection is a monotone rational-quadratic spline with n_bins=16 knots.
+  Spline parameters (3*n_bins + 1 = 49 per output coordinate) are predicted
+  by the equivariant conditioner.
+
+EQUIVARIANT CONDITIONER (make_equivariant_conditioner):
+  The conditioner takes the "pass-through" half of the particle coordinates
+  and outputs spline parameters for the "transformed" half.
+  Architecture: Circular embedding -> Linear(128) -> Transformer -> Linear(out)
+  It is permutation-equivariant: the output for particle i depends only on
+  the positions of all other particles, not on their ordering.
+
+  Input:  (B, N-1, D_pass) -- the pass-through particle coordinates
+  Step 1: circular() embedding -- maps each coordinate x in [-1,1] to
+            [cos(k*pi*x), sin(k*pi*x)] for k=1..n_freqs (8 frequencies)
+            Output shape: (B, N-1, D_pass * 2 * n_freqs) = (B, 31, 2*2*8=32)
+  Step 2: hk.Linear(embedding_size=128) -- project to embedding dimension
+  Step 3: Transformer (1 layer, 2 heads) -- self-attention over particles,
+            preserves permutation equivariance (no positional encoding added)
+  Step 4: hk.Linear(D_out * 49) -- output spline params per particle per coord
+  Step 5: reshape to (B, N-1, D_out, 49)
+
+CIRCULAR SHIFT:
+  A learned per-coordinate translation on the torus (wrap-around in [-1, 1]).
+  Initialized to zero; log-det = 0 (volume-preserving).
+  Prevents the flow from getting "stuck" when coupling layers can only see
+  half the coordinates at a time.
+
+WEIGHT INITIALIZATION:
+  All Linear weights and biases are re-initialized to N(0, 0.01) after Haiku's
+  default init. This matches the original PyTorch Correti implementation.
+  LayerNorm scale=1, offset=0; circular shifts=0.
+
+
+TRAINING PROCEDURE
+------------------
+Framework: JAX + dm-Haiku (functional NN) + Optax (optimization) + Distrax (flows)
+Optimizer: Adam with piecewise-constant LR schedule
+  Default LR: 1e-4
+  Milestones at epochs 150, 225 (for 250-epoch run)
+  Decay factor gamma=0.1 at each milestone
+  Final LR: 1e-4 -> 1e-5 -> 1e-6
+
+Batch size: 512 samples
+Dataset: 1M samples, 10% held out for validation
+Batches per epoch: 900K / 512 = 1757
+Total steps (250 epochs): 439,250
+
+TWO-SIDED TRAINING LOSS:
+  The flow is trained from both directions simultaneously.
+
+  loss_xz  (NLL direction, "x -> z"):
+    Take LJ samples x ~ p_LJ from the static training dataset.
+    Map them to the WCA latent space: z = f^{-1}(x)
+    Minimize: -mean[ -beta_WCA * U_WCA(z) + log|det J_{x->z}| ]
+    = minimize negative log-likelihood under p_WCA(z)
+    Gradient signal: "the flow's encoding of LJ samples should look like WCA"
+
+  loss_zx  (KLD direction, "z -> x"):
+    Take WCA samples z ~ p_WCA from the dynamic prior.
+    Map them to the LJ space: x = f(z)
+    Minimize: -mean[ -beta_LJ * U_LJ(x) + log|det J_{z->x}| ]
+    = minimize KL divergence from flow's pushforward to p_LJ
+    Gradient signal: "the flow's generated LJ samples should have low LJ energy"
+
+  Combined: total = w_xz * loss_xz + w_zx * loss_zx  (both weights = 1.0)
+
+  The two losses are complementary: loss_xz trains the encoder (LJ->WCA),
+  loss_zx trains the generator (WCA->LJ). Both are needed for a well-calibrated
+  bidirectional map.
+
+DATA AUGMENTATION (augment_batch):
+  Each LJ training batch is augmented with a random element of the
+  hyperoctahedral group O_D (symmetry group of the hypercube):
+    - Random permutation of axes (2! = 2 for D=2)
+    - Random sign flips per axis (2^2 = 4 for D=2)
+  Total: 8 distinct symmetry operations for 2D.
+  This is applied to ALL particles simultaneously and is physically valid
+  because both LJ and WCA energies are invariant under these operations.
+
+VALIDATION METRICS (every epoch):
+  val_loss_xz, val_loss_zx  -- same losses on held-out test set
+  ress_xz  -- RESS of importance weights for x->z direction
+  ress_zx  -- RESS of importance weights for z->x direction
+
+  RESS = 1 / (N * sum(w_i^2))  where w_i = softmax(log_weights)
+  Range [1/N, 1]; values above 0.01 indicate useful overlap.
+  In the training log, RESS values of 0.03-0.09 indicate moderate but
+  improving overlap. These are expected to grow over 250 epochs.
+
+
+TRAINING COMMAND (1M SAMPLES, 250 EPOCHS)
+------------------------------------------
+  python train.py --data-dir ./data/1M --n-samples 1000000
+
+  The --n-samples flag is required to correctly compute the LR scheduler
+  milestone steps (batches_per_epoch = 900K / 512 = 1757).
+  All other defaults are appropriate: 250 epochs, LR milestones at 150 & 225.
+
+  First run: generates MCMC data (~10-30 min on RTX 4090), then trains.
+  Subsequent runs: loads cached .npy files instantly.
+
+  Expected time on RTX 4090: ~15-20 hours for 250 epochs.
+  Per-epoch time on GB10 reference machine: ~711 seconds.
+
+
+HOW TO ADAPT TO ANOTHER PROBLEM DOMAIN
+---------------------------------------
+The codebase is designed around two energy functions and a particle coordinate
+space with PBC. To adapt to a new domain, here is what changes vs. what stays:
+
+WHAT STAYS THE SAME:
+  - Entire flow architecture (coupling_flows.py, bijectors.py, attention.py,
+    embeddings.py): fully general for any (N_particles, D) coordinate space
+    with PBC in [-L/2, L/2]. Requires no modification.
+  - Training loop structure (jax_pipeline.py): two-sided loss, dynamic prior,
+    augmentation, RESS validation. Minor modifications needed (see below).
+  - MCMC sampler (physics.py run_mcmc, generate_dataset): fully general;
+    only needs a new energy function.
+  - Config system (config.py): all dataclasses are general; just change values.
+
+WHAT TO REPLACE OR MODIFY:
+
+1. ENERGY FUNCTIONS (physics.py or new file):
+   The only domain-specific components are lj_energy() and wca_energy().
+   Replace with your source and target energy functions.
+   Contract: callable (B, N*D) -> (B,)  [returns total energy per sample]
+   Must be JAX-compatible (no Python control flow over array values).
+
+   For a new domain with source p_A and target p_B:
+     U_source(x) -> replaces wca_energy
+     U_target(x) -> replaces lj_energy
+     beta_source, beta_target -> set in PipelineConfig
+
+2. SYSTEM DIMENSIONS (config.py SystemConfig):
+   n_particles: number of particles / degrees of freedom / "agents"
+   dimensions:  spatial dimensionality (2 or 3; lattice init supports both)
+   rho:         number density (informational only; not used in flow)
+   box_length:  L -- determines the coordinate domain [-L/2, L/2]
+                If your system is not periodic, you can still use this
+                framework by choosing L large enough that PBC rarely triggers.
+
+3. PBC / COORDINATE RANGE:
+   The flow operates in [-1, 1]^(N-1, D) after rescaling from [-L/2, L/2].
+   The circular embeddings and circular shifts assume periodicity.
+   For non-periodic systems (e.g. molecular conformations):
+     - Replace circular() embedding with a standard positional encoding
+     - Replace CircularShift with a standard shift
+     - Use a larger L and check that wrap_pbc is not affecting results
+
+4. TRANSLATIONAL SYMMETRY (bijectors.py RemoveOrigin):
+   RemoveOrigin pins particle 0 at the origin to remove global translation.
+   For systems without translational symmetry (e.g. pinned atoms, molecules
+   with an anchor), skip this bijector and work in the full N*D space.
+   For systems with a different symmetry to remove (e.g. rotation), you would
+   need a different gauge-fixing bijector.
+
+5. MCMC INITIALIZATION (physics.py fcc_lattice):
+   The triangular/cubic lattice init is appropriate for homogeneous fluids.
+   For other systems, replace with an appropriate initial configuration
+   (e.g. random, a known low-energy structure, or from a pre-existing dataset).
+
+6. DATA AUGMENTATION (jax_pipeline.py augment_batch):
+   Currently uses hyperoctahedral symmetry (axis permutations + sign flips).
+   Replace with the appropriate symmetry group for your system, or disable
+   augmentation entirely by having augment_batch return the input unchanged.
+
+7. LONG-RANGE CORRECTION (physics.py lj_energy use_lrc):
+   The LRC is specific to isotropic pair potentials in PBC.
+   For other systems, set use_lrc=False in EnergyConfig.
+
+MINIMAL ADAPTATION CHECKLIST:
+  [ ] Write new energy functions compatible with (B, N*D) -> (B,) contract
+  [ ] Set n_particles, dimensions, box_length in SystemConfig
+  [ ] Set beta_source, beta_target in PipelineConfig
+  [ ] Choose appropriate MCMC step_size (target ~30-50% acceptance rate)
+  [ ] Decide whether RemoveOrigin gauge-fixing applies to your system
+  [ ] Decide whether circular embeddings / PBC are appropriate
+  [ ] Run --generate-data first to verify MCMC mixes and energies look sane
+  [ ] Check RESS during training -- values above 0.01 indicate progress
+
+TYPE-AWARE EXTENSION (already in codebase):
+  coupling_flows.py also contains make_type_aware_conditioner(), which extends
+  the equivariant conditioner to handle multi-species systems (particles with
+  different types, e.g. solute/solvent, A/B mixtures). It appends a learned
+  type embedding to the circular positional features before the Transformer.
+  This is ready to use for multi-component systems with no structural changes
+  to the flow architecture.
+
+
+KEY DESIGN DECISIONS AND THEIR RATIONALE
+-----------------------------------------
+1. Two-sided loss: Using both loss_xz and loss_zx simultaneously trains the
+   flow from both directions. NLL-only training (xz) can produce flows that
+   "mode seek" and miss parts of the target distribution. KLD training (zx)
+   alone can produce "mean-seeking" flows. The combination is more robust.
+
+2. Dynamic prior: Refreshing WCA samples at every training step (1000 MCMC
+   cycles per step) prevents mode collapse in the flow's generator direction.
+   Without this, the flow would overfit to a fixed WCA dataset that may not
+   match what the flow actually generates under loss_zx.
+
+3. RemoveOrigin: Removing translational symmetry by fixing particle 0 reduces
+   the effective DOF from 64 to 62 and avoids the flow needing to learn that
+   global translations leave energies unchanged.
+
+4. Circular embeddings: Fourier features on the torus respect PBC exactly.
+   A standard ReLU MLP with raw coordinates would have discontinuities at
+   box boundaries, leading to poor generalization for PBC systems.
+
+5. Permutation equivariance: The Transformer conditioner treats all particles
+   identically (no positional encoding), making the flow equivariant to
+   particle relabeling. This is correct for identical particles (LJ/WCA).
+
+6. Weight initialization to N(0, 0.01): Small initialization ensures the flow
+   starts close to the identity map, with initial log-det ≈ 0. This is
+   critical for numerical stability in the early training phase.
+
+
+DEPENDENCIES
+------------
+  jax + jaxlib (>=0.8.2, with CUDA for GPU training)
+  dm-haiku (0.0.16)   -- functional NN framework
+  distrax (git)       -- probabilistic bijectors / flows
+  optax (0.2.6)       -- gradient-based optimization
+  numpy, scipy, matplotlib, chex
+
+  Install JAX with CUDA first:
+    pip install "jax[cuda12]==0.8.2"  OR  pip install "jax[cuda13]==0.8.2"
+  Then:
+    pip install -r requirements.txt
+
+
+TRAINING LOG REFERENCE (from experiments/lorenzo_8b_1M/training.log)
+----------------------------------------------------------------------
+  25-epoch pilot run (1M samples, Lorenzo 8b, same hyperparameters):
+  Epoch 1:  loss=-25.8  (xz=10.75, zx=-36.57)  RESS_xz=0.021 RESS_zx=0.032
+  Epoch 5:  loss=-41.3  (xz=5.45,  zx=-46.70)  RESS_xz=0.018 RESS_zx=0.019
+  Epoch 15: loss=-42.6  (xz=4.95,  zx=-47.60)  RESS_xz=0.051 RESS_zx=0.025  [LR: 1e-5]
+  Epoch 22: loss=-43.4  (xz=4.65,  zx=-48.06)  RESS_xz=0.037 RESS_zx=0.089  [LR: 1e-6]
+  Per-epoch wall time: ~711s (GB10, CUDA 13). Expected ~180-280s on RTX 4090.
+================================================================================
