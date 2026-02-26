@@ -1,0 +1,378 @@
+INSIGHT: How generator.ipynb and plotter.ipynb Produce Smooth Reweighting Plots
+================================================================================
+
+This document traces the exact methodology from sample generation through to
+the final reweighting energy histograms, with focus on techniques that mitigate
+spiky/noisy reweighting plots.
+
+================================================================================
+1. SYSTEM SETUP
+================================================================================
+
+- 2D Lennard-Jones system, N=32 particles
+- Source (prior): WCA potential, rho=0.735, T=2 (beta=0.5)
+- Target (posterior): full LJ potential, rho=0.735, T=1 (beta=1.0)
+- Same density (scale=1.0), so the mapping is purely a potential/temperature change
+- cutin=0.8: LJ energy is linearized below r=0.8 to avoid gradient explosions
+
+The fact that scale=1.0 (same density for source and target) is significant.
+The flow only needs to handle the change in potential shape and temperature,
+not a density rescaling. This makes the mapping much easier than cases where
+the box size also changes.
+
+================================================================================
+2. FLOW ARCHITECTURE
+================================================================================
+
+- 8 coupling blocks, each containing:
+  - circular_shift (learnable, PBC-aware, volume-preserving)
+  - RQS_coupling_block on dimension (0,) conditioned on dimension (1,)
+  - RQS_coupling_block on dimension (1,) conditioned on dimension (0,)
+  - circular_shift
+  - RQS_coupling_block on dimension (1,) conditioned on dimension (0,)
+  - RQS_coupling_block on dimension (0,) conditioned on dimension (1,)
+
+  = 48 layers total (16 circular shifts + 32 RQS coupling layers)
+
+- Each RQS coupling block uses 16 spline bins
+- Conditioner: sinusoidal positional encoding + linear + TransformerEncoder + linear
+- Total trainable parameters: 6,612,512
+- Coordinates are normalized to [-1, 1] before entering the flow
+- Particle 0 is removed (placed at origin) to remove translational DOF
+
+Spline slopes are made periodic: slopes = cat([slopes, slopes[..., [0]]], dim=-1)
+This ensures C1 continuity at the boundary of the periodic domain.
+
+================================================================================
+3. TRAINING
+================================================================================
+
+Two-sided loss: loss_total = w_xz * NLL + w_zx * KLD
+
+- NLL (x->z direction): Trains the inverse flow. Takes real LJ samples x, maps
+  through F_xz to z, evaluates -beta_source * U_WCA(z) + logdetJ_xz.
+  Maximizes the likelihood of real target samples under the flow.
+
+- KLD (z->x direction): Trains the forward flow. Samples z from a "dynamic
+  prior" (cached WCA configurations refreshed by MCMC), maps through F_zx to x,
+  evaluates -beta_target * U_LJ(x) + logdetJ_zx.
+  Minimizes the KL divergence from the flow's push-forward to the target.
+
+Key: The two-sided loss simultaneously optimizes both directions. This is
+important because:
+  - NLL alone can produce mode-seeking behavior (good coverage but poor density)
+  - KLD alone can produce mode-covering behavior (good density but poor coverage)
+  - Combined training balances both, leading to better ESS/RESS
+
+Dynamic prior: During training, the source samples for the KLD loss are NOT
+fixed. They come from a cache of 90,000 WCA configurations that are
+continuously refreshed by running Metropolis MC cycles between batches. This
+provides decorrelated source samples and avoids overfitting to a fixed training
+set.
+
+Default optimizer: Adam with lr=1e-4
+
+================================================================================
+4. SAMPLE GENERATION (generator.ipynb)
+================================================================================
+
+4a. Source sampling:
+    - Uses Metropolis MC to generate fresh WCA (source) configurations
+    - 5000 equilibration cycles at 0.2*beta_source (high temperature for fast mixing)
+    - Then re-equilibrates with 5000 cycles at beta_source
+    - Then for each replica: 1000 MC cycles to generate 50,000 configurations
+    - This produces INDEPENDENT replicas -- each replica starts from its own
+      MCMC trajectory, not reusing configurations from other replicas
+
+4b. Forward transformation (z -> x):
+    - For each replica r (10 replicas):
+      - z[r] = 50,000 fresh MCMC samples from WCA
+      - Tz[r], logJ_zx = flow.F_zx(z[r])
+      - The flow transforms source configs into (approximate) target configs
+
+4c. Log-weight computation:
+    log_w_zx = -beta_target * U_LJ(Tz) - (-beta_source * U_WCA(z)) + logJ_zx
+
+    This is the standard importance weight:
+    w = p_target(Tz) / (p_source(z) * |det dF/dz|^{-1})
+
+    Written in log-space:
+    log w = log p_target(Tz) - log p_source(z) + log|det dF/dz|
+          = -beta_target * U_LJ(Tz) + beta_source * U_WCA(z) + logJ_zx
+
+4d. RESS computation:
+    Uses torch.nn.Softmax which internally applies log-sum-exp trick.
+    RESS = 1 / (N * sum(softmax(log_w)^2))
+    Range: [1/N, 1], where 1 = perfect sampling, 1/N = single dominant weight
+
+4e. Resampling (multinomial):
+    w = exp(log_w - max(log_w))     # max-subtraction for numerical stability
+    p = w / sum(w)                   # normalize to probability distribution
+    indices = np.random.choice(N, size=N, replace=True, p=p)
+    Tz_resampled = Tz[indices]
+
+    This converts the WEIGHTED sample set into an UNWEIGHTED sample set.
+
+4f. Statistics:
+    - 10 replicas x 50,000 samples = 500,000 total generated samples per direction
+    - Both z->x and x->z directions are generated
+    - All intermediate quantities saved: z, Tz, log_w_zx, Tz_resampled
+      (and corresponding x, Tinvx, log_w_xz, Tinvx_resampled)
+
+================================================================================
+5. PLOTTING (plotter.ipynb) -- THE REWEIGHTING PLOTS
+================================================================================
+
+5a. Reference data:
+    - 100,000 LJ training samples (true target distribution)
+    - Split into 10 batches of 10,000 for batch-averaged histograms
+    - Energy computed: U_x(lj_train) via LJ potential
+
+5b. Bin edge determination (CRITICAL for smoothness):
+    The bin edges are computed GLOBALLY across ALL distributions:
+
+    ref_bins = linspace(
+        min(U_ref_min, U_identity_min, U_resampled_min),
+        max(U_ref_max, U_identity_max, U_resampled_max),
+        n_bins+1
+    )
+
+    n_bins = 80
+
+    This ensures all histograms share the same bins, and the range covers
+    the full support of all distributions including the identity (untransformed)
+    which has much broader energy range.
+
+5c. Energy histograms per replica:
+    For each replica r = 0..9:
+      - Further batched: each replica of 50,000 is split into NN_batch_stride
+        sub-batches. Energy is computed per sub-batch, histogram per sub-batch,
+        then AVERAGED across sub-batches within the replica.
+      - This batch-averaging within each replica smooths out noise.
+
+5d. Bootstrap reweighting (THE KEY METHOD for smooth reweighting plots):
+
+    For each replica r:
+        U_zx_bootstrap[r], _, Delta = bootstrap_observable(
+            U_x,           # observable function (LJ energy)
+            Tz[r],         # 50,000 transformed configurations
+            n_bootstrap=100,
+            ref_bins,
+            log_weights=log_w_zx[r].cpu().numpy()
+        )
+
+    Inside bootstrap_observable:
+        for n in range(100):  # 100 bootstrap iterations
+            # 1. Resample indices WITH replacement (uniform, not weighted)
+            indx = np.random.choice(N, size=N, replace=True)
+
+            # 2. Compute observable on bootstrapped sample
+            U_values = U_x(Tz[indx])
+
+            # 3. Compute importance weights for the resampled indices
+            weights = exp(log_w[indx] - max(log_w[indx]))
+
+            # 4. WEIGHTED histogram with density=True
+            hist, _ = np.histogram(U_values, bins=ref_bins, density=True, weights=weights)
+
+        # 5. AVERAGE across all bootstrap iterations
+        return hist.mean(axis=0), bin_centers, hist.std(axis=0, ddof=1)/sqrt(n_bootstrap)
+
+    The final reweighting plot uses:
+        U_zx_bootstrap.mean(axis=0)  -- averaged across 10 replicas
+        Delta = U_zx_bootstrap.std(axis=0, ddof=1) / sqrt(N_replicas)
+
+    So the smoothing comes from THREE levels of averaging:
+    1. 100 bootstrap iterations per replica (smooths each replica's histogram)
+    2. 10 independent replicas
+    3. Mean across replicas
+
+5e. The comprehensive comparison plot shows:
+    - Reference (blue): batch-averaged histogram of true LJ samples
+    - Identity (C1): energy of WCA samples evaluated under LJ potential (no flow)
+    - Transformed (C2): energy of flow-transformed samples (no reweighting)
+    - Reweighted (C3): bootstrap-reweighted histogram with error bars
+
+    Error bars: std(axis=0, ddof=1) / sqrt(N_replicas) across replica means
+
+    Vertical lines show mean energies:
+    - <U_B> Reference: weighted average of bin centers by reference histogram
+    - <U_B(F(x_A))>: weighted average by reweighted histogram
+
+================================================================================
+6. WHY THIS PRODUCES SMOOTH PLOTS (AND WHY YOURS MIGHT BE SPIKY)
+================================================================================
+
+6a. MASSIVE SAMPLE COUNT
+    - 50,000 samples per replica, 10 replicas = 500,000 total
+    - Even at 3% ESS, that's an effective sample size of ~15,000
+    - With 80 bins, that's ~187 effective samples per bin on average
+    - If you're using fewer total samples, the effective count per bin drops fast
+
+6b. BOOTSTRAP AVERAGING (most likely the key difference)
+    The plotter does NOT just compute a single weighted histogram.
+    It runs 100 bootstrap iterations, each producing a slightly different
+    weighted histogram (because different indices are resampled), then AVERAGES
+    them. This is effectively a variance reduction technique for the histogram
+    estimator.
+
+    Compare: if you just compute np.histogram(energies, weights=weights, density=True)
+    once, each bin's value depends on exactly which samples fall in it and their
+    weights. A few high-weight samples in a bin cause spikes. The bootstrap
+    average smooths this because each iteration draws different subsets.
+
+    HOWEVER: note the bootstrap here resamples UNIFORMLY and applies weights
+    to the histogram. It does NOT resample proportional to the weights. This is
+    an important distinction -- weighted bootstrap vs. resampled bootstrap.
+
+6c. REPLICA AVERAGING
+    10 independent MCMC trajectories produce 10 independent sets of source samples.
+    Each goes through the same flow but starts from different source configurations.
+    Averaging across replicas further reduces variance.
+
+    If you're using a single set of source samples split into "replicas" (just
+    partitioning), that's NOT the same. True independent replicas require separate
+    MCMC runs.
+
+6d. BATCH-AVERAGED HISTOGRAMS
+    Even before bootstrapping, the raw histograms per replica are computed by:
+    - Splitting 50,000 samples into sub-batches
+    - Computing histogram per sub-batch
+    - Averaging histograms
+    This is mathematically equivalent to one big histogram, but guards against
+    memory issues and provides a natural smoothing.
+
+6e. MODERATE BIN COUNT
+    n_bins = 80 for 50,000 samples. With fewer effective samples (3% ESS ~1,500),
+    80 bins means ~18 effective samples per bin. Going to 100+ bins would make
+    things spikier. The bin count is tuned to the effective sample size.
+
+6f. ENERGY LINEARIZATION (cutin=0.8)
+    The LJ potential is linearized below r=0.8. Without this, rare close
+    approaches produce extremely high energies that create massive importance
+    weight outliers. The linearization bounds the energy contribution from
+    close contacts, which directly limits the range of log-weights and improves
+    ESS.
+
+    If your system doesn't use cutin or uses a smaller value, you may get
+    more extreme weights from rare high-energy configurations.
+
+6g. FAVORABLE SYSTEM PARAMETERS
+    - Same density (scale=1.0) means the mapping is simpler
+    - 2D with only 32 particles is relatively low-dimensional (64 DOFs)
+    - WCA to full LJ is a moderate change (adding attractive tail)
+    - T=2 to T=1 is a factor-2 temperature change, not extreme
+
+================================================================================
+7. SPECIFIC THINGS TO CHECK IN YOUR OWN PIPELINE
+================================================================================
+
+7a. Are you using bootstrap reweighting or just a single weighted histogram?
+    Single weighted histograms are inherently noisy. The bootstrap averaging
+    here is doing significant variance reduction.
+
+7b. How many TOTAL samples (before reweighting)?
+    At 3% ESS, you need N_total / 0.03 = ~33x more raw samples than your
+    desired effective count. For 80 bins to look smooth, you want ~100+ effective
+    samples per bin, so ~8,000 effective = ~267,000 raw minimum.
+
+7c. Are your replicas truly independent?
+    This code generates each replica from a fresh MCMC trajectory:
+    z, _, _ = MCMC_pr.sample_space(NN_replica_size, beta_source)
+    Each call runs its own equilibration + production. If your replicas are
+    just partitions of one big sample, inter-replica averaging won't help.
+
+7d. What's your n_bins relative to effective sample size?
+    Rule of thumb: effective_samples_per_bin = (N_total * ESS) / n_bins > 50
+    This code: (50,000 * 0.03) / 80 = 18.75 per replica, but then bootstrapped
+    and averaged across 10 replicas.
+
+7e. Energy linearization / cutin:
+    Check if you're clamping or linearizing the potential at short range.
+    Without cutin, a single close pair can produce log_w = -10000, which
+    makes that sample's weight essentially 0 and wastes your ESS budget.
+
+7f. Are you using density=True in np.histogram?
+    This normalizes the histogram to integrate to 1. Without it, the raw
+    counts with weights can have arbitrary scale and look erratic.
+
+7g. Weight normalization:
+    The code uses exp(log_w - max(log_w)) / sum(exp(log_w - max(log_w))).
+    If you're exponentiating without the max-subtraction, you get overflow.
+    If you're normalizing differently, it could affect the histogram.
+
+================================================================================
+8. THE TWO TYPES OF "REWEIGHTING PLOTS" IN THIS NOTEBOOK
+================================================================================
+
+There are actually two different visualizations:
+
+TYPE 1 - RESAMPLED HISTOGRAMS (simpler, noisier):
+    Plotted in the first Z->X energy cell and in the B->A energy cell.
+    These use Tz_resampled -- configurations already resampled by multinomial
+    sampling in the generator. The histogram is UNWEIGHTED (density=True).
+    These show each replica as a separate translucent bar plot.
+    These ARE spiky -- you can see 10 overlapping noisy histograms.
+
+TYPE 2 - BOOTSTRAP REWEIGHTED HISTOGRAMS (smoother):
+    Plotted in the comprehensive comparison cell (the one saved to energyA2B.png).
+    These use U_zx_bootstrap -- the result of bootstrap_observable().
+    Mean across 10 replicas with error bars from replica std.
+    These are much smoother due to the triple averaging described above.
+
+If you're producing Type 1 and expecting Type 2 smoothness, that's the gap.
+
+================================================================================
+9. EXACT CODE PATH FOR THE "REWEIGHTED" CURVE IN THE MAIN PLOT
+================================================================================
+
+Step-by-step for the energyA2B.png "Reweighted" bar:
+
+1. generator.ipynb cell 17:
+   - For r in 0..9:
+     - z[r] = 50,000 MCMC samples from WCA at (rho=0.735, T=2)
+     - Tz[r], logJ_zx = flow.F_zx(z[r])
+     - log_w_zx[r] = -1.0*LJ.energy(Tz[r]) + 0.5*WCA.energy(z[r]) + logJ_zx
+     - Saved to disk: Tz_{r}.pt, log_w_zx_{r}.pt
+
+2. plotter.ipynb cell ~12 (loading):
+   - Loads all 10 replicas of Tz[r] and log_w_zx[r]
+
+3. plotter.ipynb cell ~14 (energy calculation):
+   - For r in 0..9:
+     - U_zx_bootstrap[r] = bootstrap_observable(
+         U_x=LJ.energy,
+         samples=Tz[r],          # shape (50000, 64)
+         n_bootstrap=100,
+         ref_bins=global_bins,    # 81 edges -> 80 bins
+         log_weights=log_w_zx[r]  # shape (50000,)
+       )
+
+   Inside bootstrap_observable, for each of 100 iterations:
+     a. indx = random choice of 50,000 from 50,000 with replacement
+     b. U_values = LJ.energy(Tz[r][indx])  (50,000 energy values)
+     c. weights = exp(log_w_zx[r][indx] - max(log_w_zx[r][indx]))
+     d. hist = np.histogram(U_values, bins=ref_bins, density=True, weights=weights)
+   Returns mean histogram over 100 iterations.
+
+4. plotter.ipynb comprehensive plot cell:
+   - Delta = U_zx_bootstrap.std(axis=0, ddof=1) / sqrt(10)
+   - plt.bar(mids, U_zx_bootstrap.mean(axis=0), yerr=Delta, ...)
+
+================================================================================
+10. SUMMARY: RANKING OF SMOOTHING CONTRIBUTIONS
+================================================================================
+
+From most to least impactful for reducing spikiness:
+
+1. BOOTSTRAP AVERAGING (100 iterations) -- smooths the weighted histogram estimator
+2. REPLICA AVERAGING (10 independent replicas) -- reduces variance by sqrt(10)
+3. LARGE RAW SAMPLE COUNT (50,000 per replica) -- more samples = better coverage
+4. MODERATE BIN COUNT (80) -- matched to effective sample size
+5. ENERGY LINEARIZATION (cutin=0.8) -- prevents extreme weight outliers
+6. DENSITY NORMALIZATION (density=True) -- consistent y-axis scaling
+7. GLOBAL BIN EDGES -- same bins for all distributions ensures fair comparison
+
+If your ESS is similar (~3%) but plots are spiky, the most likely culprit is
+that you're missing #1 (bootstrap averaging) and/or #2 (truly independent
+replicas). Try implementing bootstrap_observable as shown and see if it helps.

@@ -1,0 +1,242 @@
+===========================================================================
+  MCMC EXPERIMENT DETAILS — 2D LJ GAS-LIQUID COEXISTENCE
+  Code: physics.py, diagnostics.py, scripts/diag{1-5}_*.py
+===========================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. SYSTEM DEFINITION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Ensemble:     NVT (canonical), 2D periodic box
+  Particles:    N = 128
+  Density:      ρ* = N/L² = 0.30  →  L = sqrt(128/0.30) = 20.656 σ
+  Potential:    Lennard-Jones, ε=σ=1 (reduced units)
+                  u(r) = 4[r⁻¹² − r⁻⁶] − u(r_cut)   [shifted at cutoff]
+  LJ cutoff:    r_c = 2.5 σ  (hardcoded in lj_energy; shift makes u continuous)
+  Core region:  r < 0.8 σ → linearised (avoids divergence during MCMC moves)
+  LRC:          use_lrc=False for all diagnostic/calibration runs
+                (long-range correction is available but disabled)
+  Dimensions:   D = 2
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. THE MCMC ALGORITHM  (physics.py: run_mcmc / _metropolis_step)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Algorithm: single-particle Metropolis–Hastings
+
+Each "move" (1 MC cycle):
+  1. Choose one particle uniformly at random from N=128.
+  2. Propose displacement: Δr ~ N(0, step_size²) independently in x and y.
+  3. Apply displacement, wrap under PBC (minimum image convention).
+  4. Compute new total energy E_new.
+  5. Accept with probability min(1, exp(−β ΔE)) where ΔE = E_new − E_old.
+  6. If rejected, keep old configuration.
+
+Implementation details:
+  - B chains run in parallel as a batch: configs shape (B, N*D).
+  - Inner loop implemented with jax.lax.scan over n_cycles for JIT compilation.
+  - One particle chosen per chain per cycle (NOT a full sweep of N particles).
+    So "500K moves" = 500,000 single-particle proposals per chain.
+  - All randomness from JAX PRNG (explicit key splitting, reproducible).
+  - Energies reused between steps (stored and updated, not recomputed in full).
+
+β (inverse temperature):
+  β = 1/T*  where T* is the reduced temperature k_BT/ε (with k_B=ε=1).
+
+Step size:
+  Calibrated automatically before each run via calibrate_step_size():
+    - Tests step sizes from candidates (0.05, 0.1, 0.2, 0.4) σ.
+    - Runs 2000 trial moves per candidate on 4 liquid-init configs.
+    - Selects step size closest to target acceptance rate of 35%.
+  Typical result: step_size ≈ 0.1–0.2 σ at T*=0.36–0.45.
+  Step size is calibrated once at T*=0.39 and reused across all 6 temperatures
+  in diag4 (this is a minor approximation; ideally recalibrated per T).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. INITIALISATIONS — HOW THEY WORK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Two distinct starting configurations are used to probe both branches of the
+phase diagram and detect metastability.
+
+────────────────────────────────────────────────
+3a. LIQUID INITIALISATION  (make_liquid_init)
+────────────────────────────────────────────────
+
+Goal: start from a dense, well-packed state resembling the liquid phase.
+
+Method:
+  1. Compute a "tight box" of side L_tight = sqrt(N/0.75).
+     This is the box length for a 2D triangular lattice at ρ*=0.75.
+     For N=128: L_tight = sqrt(128/0.75) = 13.06 σ.
+  2. Build a 2D triangular lattice (rows offset by 0.5 per-row for hexagonal
+     packing) with N sites, scaled to fit inside L_tight.
+     Nearest-neighbour spacing ≈ L_tight/sqrt(N) ≈ 1.15 σ, which is just
+     above the LJ equilibrium distance 2^(1/6) ≈ 1.122 σ.
+     This gives a moderate negative energy — liquid-like.
+  3. Add Gaussian noise: Δ ~ N(0, 0.01²) per particle per dimension.
+  4. Positions remain in [-L_tight/2, L_tight/2] ⊂ [-L/2, L/2], so the
+     cluster sits in the centre of the full simulation box.
+     This means the liquid droplet is surrounded by vacuum — it is NOT
+     at full-box liquid density (ρ*=0.75), but at the system density
+     ρ*=0.30 with particles concentrated in one region.
+  5. No PBC wrapping needed (tight lattice is well inside full box).
+  6. Optional check: energy_fn called to abort if non-finite energy.
+
+Physical interpretation:
+  The configuration looks like a dense cluster of 128 particles occupying
+  a sub-region of the box, with the rest of the box empty.
+  At sub-critical temperatures, this cluster is stable and represents the
+  liquid droplet coexisting with dilute gas.
+
+────────────────────────────────────────────────
+3b. GAS INITIALISATION  (make_gas_init)
+────────────────────────────────────────────────
+
+Goal: start from a uniform, dispersed state resembling the gas phase.
+
+Method:
+  1. Build a 2D triangular lattice scaled to the FULL simulation box L.
+     For N=128, L=20.656 σ: spacing ≈ 20.656/sqrt(128) ≈ 1.83 σ.
+     At this spacing, all particle pairs are near the flat part of the
+     shifted LJ potential, so energy is near zero — gas-like.
+  2. Add Gaussian noise: Δ ~ N(0, 0.01²) per particle per dimension.
+  3. Wrap with PBC: positions kept in [-L/2, L/2].
+  4. Optional energy sanity check.
+
+Physical interpretation:
+  Particles are spread uniformly across the box at ρ*=0.30.
+  At sub-critical temperatures, this is a metastable gas state —
+  MCMC must nucleate a liquid cluster to reach equilibrium, which
+  takes very long (or never in 500K moves at T*≤0.36).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. OBSERVABLES MEASURED DURING RUNS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+U/N — energy per particle:
+  Total LJ potential energy divided by N.
+  Negative = liquid-like (attractive interactions dominate).
+  Near-zero = gas-like (particles too far apart to interact much).
+
+Cluster order parameter (OP) — largest_cluster_fraction:
+  1. Compute all N*(N-1)/2 pairwise distances under PBC.
+  2. Define a "bond" between i and j if |r_ij| < r_cut_OP.
+     r_cut_OP = 1.6733 σ — the first minimum of g(r) from Stage A.
+     NOTE: r_cut_OP ≠ LJ cutoff (2.5 σ). It is only a cluster criterion.
+  3. Build adjacency matrix; find connected components (scipy.sparse).
+  4. OP = (size of largest component) / N.
+  OP ≈ 1.0 → all particles in one cluster (liquid).
+  OP ≈ 0.01–0.10 → many small clusters or isolated particles (gas).
+
+g(r) — radial distribution function:
+  2D normalisation: g(r) = <n_pairs(r,r+dr)> / [N · ρ · 2π r dr]
+  Computed over a batch of configurations; bins in [0, L/2].
+  Used in Stage A only to determine r_cut_OP.
+
+Virial pressure (used in v2 calibration):
+  P = ρ*T* + (1/2A) Σ_{i>j, r<2.5σ} [48/r¹² − 24/r⁶]
+  Area A = L². The shift is a constant and does not affect forces.
+
+Ashman D (bimodality statistic):
+  Fit 2-component Gaussian mixture to a 1-D observable (U/N or OP).
+  D = |μ₁ − μ₂| / sqrt((σ₁² + σ₂²)/2)
+  D > 2 → well-separated bimodal distribution → genuine two-phase signal.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. EXPERIMENT SPECIFICATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━ Diagnostic 1: Long convergence test (scripts/diag1_long_convergence.py)
+  Temperatures:  T*=0.36, T*=0.45
+  N chains:      4 liquid-init + 4 gas-init  (8 total per temperature)
+  Total moves:   500,000 per chain
+  Chunk size:    5,000 moves (U/N and OP recorded every 5K moves)
+  Snapshots:     every 50,000 moves (10 filmstrip frames)
+  Step size:     calibrated independently per temperature (~35% acceptance)
+  r_cut_OP:      1.6733 σ
+  Output:        NPZ (time series + final configs), timeseries PNG, filmstrip PNG
+
+━━ Diagnostic 2: Equilibrium scatter grid (scripts/diag2_equilibrium_grid.py)
+  Reads diag1 NPZ files.
+  Plots 2×4 scatter plots of final configurations at T*=0.36 and 0.45
+  (4 liquid-init and 4 gas-init final frames each).
+  No new MCMC run.
+
+━━ Diagnostic 3: OP and energy histograms (scripts/diag3_op_histogram.py)
+  Reads diag1 NPZ files.
+  Uses last 40% of the run (200K moves, samples 300–500K) as production.
+  Plots histogram + KDE for U/N and cluster OP, liq vs gas overlaid.
+  Reports Ashman D for both observables.
+  Run at T*=0.36 and T*=0.45.
+
+━━ Diagnostic 4: Temperature panel (scripts/diag4_temp_panel.py)
+  Temperatures:  T*=0.33, 0.36, 0.39, 0.42, 0.45, 0.50  (6 temperatures)
+  N chains:      4 liquid-init + 4 gas-init per temperature
+  Total moves:   500,000 per chain (same as diag1)
+  Chunk size:    5,000 moves
+  Step size:     calibrated ONCE at T*=0.39, reused for all 6 temperatures
+  r_cut_OP:      1.6733 σ
+  Output:        NPZ per temperature, scatter_grid.png (main summary figure)
+
+  KEY NUMBERS (ΔU/N = |liq_mean − gas_mean| at end of 500K moves):
+    T*=0.33  ΔU/N=0.394   0/4 gas chains mixed
+    T*=0.36  ΔU/N=0.336   0/4 gas chains mixed
+    T*=0.39  ΔU/N=0.278   1/4 gas chains mixed
+    T*=0.42  ΔU/N=0.169   4/4 gas chains mixed,  τ_med≈292K moves
+    T*=0.45  ΔU/N=0.148   4/4 gas chains mixed,  τ_med≈338K moves
+    T*=0.50  ΔU/N=0.061   4/4 gas chains mixed,  τ_med≈108K moves
+
+━━ Diagnostic 5: Mixing time analysis (scripts/diag5_mixing_time.py)
+  Reads all NPZ files from diag1 and diag4.
+  Mixing criterion: gas chain U/N drops to ≤ (liq_mean + 0.10).
+    liq_mean = mean U/N of liquid-init chains over last 20 recorded samples.
+  For each gas chain: τ = first sample_time where criterion is met; ∞ if never.
+  Output: mixing_time.png (scatter + median τ vs T*, plus all gas trajectories)
+
+━━ v2 Calibration: Pressure isotherms (experiments/v2_calib/)
+  Stage 1: Two separate boxes at each temperature:
+    Liquid box: ρ*=0.60 (L_liq = sqrt(128/0.60) = 14.61 σ)
+    Gas box:    ρ*=0.05 (L_gas = sqrt(128/0.05) = 50.60 σ)
+  Temperatures tested: T*=0.28, 0.30, 0.33, 0.36, 0.39
+  Measured: virial pressure in each box; pressure equality → T_coex estimate.
+  Result: T_coex ≈ 0.39 (pressure difference smallest at this temperature)
+
+  Stage 2: Single-box nucleation scan at ρ*=0.10 (mixed density):
+    Gas-init chains run at T_coex; survival time measured.
+    Output: nucl_traces_rho0.10.png
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. WHAT "500K MOVES" MEANS PHYSICALLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Each move attempts to displace one particle.  With N=128:
+  500,000 moves = 500,000 / 128 ≈ 3,906 full sweeps (attempted moves per particle).
+  Or equivalently: each particle gets ~3906 attempted displacement trials on average.
+
+At T*=0.36 with acceptance rate ~35%:
+  Each particle makes ~1367 accepted moves in 500K attempts.
+  Average displacement per accepted move ≈ step_size (≈0.1–0.2 σ per component).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. JAX IMPLEMENTATION NOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - All MCMC is JIT-compiled via JAX. The inner loop uses jax.lax.scan,
+    which unrolls into a single compiled kernel — no Python overhead per step.
+  - Batch dimension B (n_chains) is vectorised: all chains advance simultaneously
+    with a single kernel call per chunk of moves.
+  - Energy function computes ALL N*(N-1)/2 = 8128 pair distances per config
+    at every step (no neighbour lists). This is feasible for N=128.
+  - PRNG: jax.random.PRNGKey(42) as global seed; explicit key splitting at
+    every random operation (particle selection, displacement, acceptance).
+    This means runs are exactly reproducible given the same seed.
+  - Platform: GPU (CUDA) or CPU depending on JAX device configuration.
+===========================================================================

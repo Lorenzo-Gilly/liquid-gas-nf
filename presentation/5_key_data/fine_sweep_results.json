@@ -1,0 +1,103 @@
+{
+  "T_coex": 0.39,
+  "rho_best": 0.3,
+  "D_ashman_best": 2.689878819962409,
+  "sweep": [
+    {
+      "T_star": 0.39,
+      "D_ashman": 2.689878819962409,
+      "op_gap": 0.24155566406249995,
+      "n_trans_liq": 0,
+      "n_trans_gas": 3,
+      "step_size": 0.2
+    },
+    {
+      "T_star": 0.4,
+      "D_ashman": 2.2278020649872285,
+      "op_gap": 0.22312109375,
+      "n_trans_liq": 0,
+      "n_trans_gas": 1,
+      "step_size": 0.2
+    },
+    {
+      "T_star": 0.41,
+      "D_ashman": 2.2103966288193835,
+      "op_gap": 0.18734887695312497,
+      "n_trans_liq": 0,
+      "n_trans_gas": 3,
+      "step_size": 0.2
+    },
+    {
+      "T_star": 0.42,
+      "D_ashman": 2.3355011491769835,
+      "op_gap": 0.20573657226562503,
+      "n_trans_liq": 0,
+      "n_trans_gas": 1,
+      "step_size": 0.2
+    },
+    {
+      "T_star": 0.43,
+      "D_ashman": 2.1156056020080314,
+      "op_gap": 0.18722558593749994,
+      "n_trans_liq": 0,
+      "n_trans_gas": 1,
+      "step_size": 0.2
+    },
+    {
+      "T_star": 0.44,
+      "D_ashman": 2.0760275747399235,
+      "op_gap": 0.16390673828125002,
+      "n_trans_liq": 0,
+      "n_trans_gas": 3,
+      "step_size": 0.2
+    },
+    {
+      "T_star": 0.45,
+      "D_ashman": 2.3737161029032134,
+      "op_gap": 0.18495556640625,
+      "n_trans_liq": 0,
+      "n_trans_gas": 7,
+      "step_size": 0.2
+    },
+    {
+      "T_star": 0.46,
+      "D_ashman": 2.3941725058456518,
+      "op_gap": 0.1949707031250001,
+      "n_trans_liq": 0,
+      "n_trans_gas": 1,
+      "step_size": 0.2
+    },
+    {
+      "T_star": 0.47,
+      "D_ashman": 2.132694055020615,
+      "op_gap": 0.13111401367187503,
+      "n_trans_liq": 0,
+      "n_trans_gas": 5,
+      "step_size": 0.2
+    },
+    {
+      "T_star": 0.48,
+      "D_ashman": 2.09315825036522,
+      "op_gap": 0.14831152343749998,
+      "n_trans_liq": 0,
+      "n_trans_gas": 5,
+      "step_size": 0.2
+    },
+    {
+      "T_star": 0.49,
+      "D_ashman": 2.385521744683114,
+      "op_gap": 0.18378125,
+      "n_trans_liq": 0,
+      "n_trans_gas": 3,
+      "step_size": 0.2
+    },
+    {
+      "T_star": 0.5,
+      "D_ashman": 2.2512030834212093,
+      "op_gap": 0.1821005859375,
+      "n_trans_liq": 0,
+      "n_trans_gas": 3,
+      "step_size": 0.2
+    }
+  ]
+}

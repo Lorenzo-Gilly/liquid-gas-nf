@@ -6,18 +6,26 @@ Usage:
     python calibrate_coex.py [--out-dir experiments/calibration] [--seed 42]
 
 Stage A: Determine r_cut from g(r) at T*=0.42, rho*=0.35.
-Stage B: Coarse sweep over (T*, rho*) grid — classify coexistence vs single-phase.
+Stage B: Focused sweep over literature-informed (T*, rho*) grid.
 Stage C: Fine temperature sweep at best density — find T_coex via Ashman's D.
 Stage D: Verify T_base (warm single-phase reference).
 Stage E: Visual gallery PDF.
 
 Parameters adjusted from spec for robustness:
     Stage A:  60K moves  (spec: 20K)  — near-coexistence equilibration is slow.
-    Stage B:  20K hot + 50K cold + 50K prod  (spec: 10K+20K+20K)
-    Stage C:  30K hot + 100K cold + 200K prod  (spec: 20K+50K+100K)
+    Stage B:  5K hot + 100K cold + 100K prod  (gas-init: 0 hot + 0 cold + 100K prod)
+    Stage C:  5K hot + 100K cold + 200K prod  (gas-init: 0 hot + 0 cold + 200K prod)
     Stage D:  50K equil + 100K prod  (spec: 20K+50K)
 
-All energies use lj_energy with use_lrc=False  [A1].
+Key changes from initial run (N=32 showed no coexistence signal):
+    N: 32 → 64.  Larger system reduces finite-size T_c shift and widens the
+       two-phase density window, making the OP gap detectable.
+    Grid: product sweep → focused 10-point grid from literature.
+    Gas-init chains: skip hot equilibration.  The hot equil at 5×T*_cold
+       destroys the gas-phase initial condition, causing both inits to condense
+       into liquid.  Gas chains now start cold from the lattice directly.
+
+LJ potential: cutoff=2.5σ, shifted, use_lrc=False [A1] — already correct.
 All move counts are single-particle moves [A3].  Comments note full-sweep equiv.
 """
 
@@ -57,7 +65,13 @@ from diagnostics import (
 # ---------------------------------------------------------------------------
 
 def _make_lj(N, D, L):
-    """JIT-compiled LJ energy function with use_lrc=False [A1]."""
+    """JIT-compiled LJ energy function with use_lrc=False [A1].
+
+    Note: the LJ interaction cutoff is 2.5σ (the default in lj_energy),
+    hardcoded as a physics choice — NOT the g(r)-derived r_cut from Stage A.
+    The Stage A r_cut (~1.46σ) is used only for the cluster order parameter
+    (nearest-neighbour connectivity), not for the energy.
+    """
     return jax.jit(functools.partial(
         lj_energy,
         n_particles=N,
@@ -69,38 +83,54 @@ def _make_lj(N, D, L):
 
 def _run_chains(init_configs, energy_fn, beta, step_size,
                 n_hot, n_cold, n_prod, n_save_every,
-                N, D, L, key):
+                N, D, L, key, skip_hot_equil=False):
     """Run n_chains MCMC chains in parallel (vectorised).
 
-    Protocol: hot equilibration (0.2*beta) → cold equilibration (beta) →
+    Protocol: [hot equilibration (0.2*beta)] → cold equilibration (beta) →
     production sampling.
 
     Args:
-        init_configs: (n_chains, N*D) initial configurations.
-        energy_fn:    callable (B, N*D) -> (B,).
-        beta:         target inverse temperature.
-        step_size:    Gaussian displacement σ.
-        n_hot:        single-particle moves for hot equilibration.
-        n_cold:       single-particle moves for cold equilibration.
-        n_prod:       single-particle moves for production.
-        n_save_every: save configs every this many production moves.
-        N, D, L:      system parameters.
-        key:          JAX PRNG key.
+        init_configs:    (n_chains, N*D) initial configurations.
+        energy_fn:       callable (B, N*D) -> (B,).
+        beta:            target inverse temperature.
+        step_size:       Gaussian displacement σ.
+        n_hot:           single-particle moves for hot equilibration.
+        n_cold:          single-particle moves for cold equilibration.
+        n_prod:          single-particle moves for production.
+        n_save_every:    save configs every this many production moves.
+        N, D, L:         system parameters.
+        key:             JAX PRNG key.
+        skip_hot_equil:  if True, skip hot equil.  Gas-init chains always set
+                         this True.  Liquid-init chains use brief gentle warmup
+                         (0.8*beta) to relax lattice defects without destroying
+                         phase identity.  Never use 0.2*beta (erases all phase
+                         memory).
+                         NOTE: For gas-init, also pass n_cold=0.  The full-box
+                         triangular lattice at ρ*=0.35 has spacing 1.80σ >
+                         r_cut=1.72σ, so gas-init starts at OP≈0.016.  Any
+                         cold equil allows nucleation into liquid (OP→1), erasing
+                         the gas-phase signal.  With n_cold=0 production starts
+                         immediately and early samples capture the gas-like state.
     Returns:
         samples: (n_samples_per_chain, n_chains, N*D) production configs.
                  n_samples_per_chain = n_prod // n_save_every
     """
     configs = jnp.array(init_configs)
 
-    # Hot equilibration
+    # Hot equilibration — gentle warmup at 0.8*beta (T_hot = 1.25*T_cold).
+    # Always split key to keep PRNG stream consistent even when skipping.
     key, k1 = jax.random.split(key)
-    configs, _ = run_mcmc(configs, energy_fn, 0.2 * beta, n_hot,
-                          k1, step_size, L, N, D)
+    if not skip_hot_equil and n_hot > 0:
+        configs, _ = run_mcmc(configs, energy_fn, 0.8 * beta, n_hot,
+                              k1, step_size, L, N, D)
 
-    # Cold equilibration
+    # Cold equilibration — skip for gas-init (n_cold=0) so production starts
+    # while particles are still in the dispersed lattice configuration (OP≈0).
+    # Without this, nucleation occurs during equil and OP_gas → 1.0 same as liq.
     key, k2 = jax.random.split(key)
-    configs, _ = run_mcmc(configs, energy_fn, beta, n_cold,
-                          k2, step_size, L, N, D)
+    if n_cold > 0:
+        configs, _ = run_mcmc(configs, energy_fn, beta, n_cold,
+                              k2, step_size, L, N, D)
 
     # Production: save every n_save_every moves
     n_saves = n_prod // n_save_every
@@ -118,6 +148,66 @@ def _build_init_batch(init_fn, n_chains, N, D, L, key):
     """Stack n_chains initial configurations from init_fn."""
     keys = jax.random.split(key, n_chains)
     return jnp.stack([init_fn(N, D, L, rng_key=k) for k in keys])
+
+
+def _make_gas_init_dispersed(N, D, L, r_cut, rng_key=None):
+    """Triangular lattice with spacing > r_cut — guarantees OP=1/N initially.
+
+    make_gas_init uses fcc_lattice scaled to the full box, which gives
+    spacing ≈ 1/sqrt(rho*) ≈ 1.69σ.  For some N (e.g. N=128 at rho*=0.35)
+    this is BELOW r_cut, so the gas-init starts fully connected (OP=1.0)
+    and n_cold=0 has no benefit.  This function builds a coarser lattice
+    whose spacing is guaranteed to exceed r_cut, placing all particles in
+    isolated sites (OP = 1/N) regardless of N or rho*.
+
+    Uses the smallest factor f such that f*r_cut spacing fits N particles
+    within the simulation box, trying f = 1.03, 1.05, 1.08, 1.10.
+    """
+    import math as _math
+    assert D == 2, "_make_gas_init_dispersed is 2D only"
+
+    for factor in [1.03, 1.05, 1.08, 1.10, 1.15, 1.20]:
+        spacing = factor * r_cut
+        n_cols = int(L / spacing)
+        n_rows = int(L / (spacing * _math.sqrt(3) / 2))
+        if n_cols * n_rows >= N:
+            break
+    else:
+        warnings.warn(
+            f"_make_gas_init_dispersed: cannot fit N={N} with spacing > "
+            f"r_cut={r_cut:.3f} in L={L:.3f}. Falling back to make_gas_init.")
+        return make_gas_init(N, D, L, rng_key=rng_key)
+
+    # Centred triangular lattice — all positions within [-L/2, L/2]
+    x_extent = (n_cols - 0.5) * spacing
+    y_extent = (n_rows - 1) * spacing * _math.sqrt(3) / 2
+    x_start = -x_extent / 2
+    y_start = -y_extent / 2
+
+    positions = []
+    for j in range(n_rows):
+        for i in range(n_cols):
+            x = x_start + (i + 0.5 * (j % 2)) * spacing
+            y = y_start + j * spacing * _math.sqrt(3) / 2
+            positions.append([x, y])
+            if len(positions) >= N:
+                break
+        if len(positions) >= N:
+            break
+
+    pos = np.array(positions[:N], dtype=np.float32)
+
+    # Tiny noise well below (spacing - r_cut) to break symmetry without
+    # forming any bonds.  noise_scale ≤ 0.2*(spacing - r_cut) ensures
+    # even 3σ fluctuations cannot create an unwanted bond.
+    noise_scale = min(0.01, 0.2 * (spacing - r_cut))
+    if rng_key is not None:
+        noise = noise_scale * np.array(jax.random.normal(rng_key, (N, D)))
+    else:
+        noise = noise_scale * np.random.default_rng(123).standard_normal((N, D))
+    pos = pos + noise
+
+    return jnp.array(pos.ravel())
 
 
 # ---------------------------------------------------------------------------
@@ -150,9 +240,10 @@ def stage_a(N, D, out_dir, key, seed):
     x0 = make_liquid_init(N, D, L, rng_key=k_init)
     configs = x0[None]   # (1, N*D)
 
-    # Hot equilibration: 15K moves
+    # Gentle warmup at 0.8*beta (T_hot=1.25*T_cold) to melt lattice defects.
+    # Stage A only uses liquid-init for g(r); no hysteresis concern here.
     key, k1 = jax.random.split(key)
-    configs, _ = run_mcmc(configs, energy_fn, 0.2 * beta, 15_000,
+    configs, _ = run_mcmc(configs, energy_fn, 0.8 * beta, 15_000,
                           k1, step_size, L, N, D)
 
     # Cold equilibration: 15K moves
@@ -199,33 +290,51 @@ def stage_a(N, D, out_dir, key, seed):
 # Stage B — Coarse sweep
 # ---------------------------------------------------------------------------
 
-T_LIST  = [0.30, 0.33, 0.36, 0.38, 0.40, 0.42, 0.44, 0.46, 0.48, 0.50, 0.55, 0.65]
-RHO_LIST = [0.25, 0.30, 0.35, 0.40, 0.50]
+# Focused 10-point grid from literature (2D LJ, r_cut=2.5σ, T*_c≈0.44–0.46)
+# Gas branch ρ*: 0.02–0.10; liquid branch ρ*: 0.52–0.68; critical ρ*≈0.35
+# Grid brackets the two-phase region with a single-phase control at T*=0.50.
+GRID_POINTS = [
+    (0.30, 0.35),   # deep subcritical, near rho*_c — strong separation expected
+    (0.33, 0.35),   # subcritical, near rho*_c
+    (0.36, 0.30),   # subcritical, gas-side of rho*_c
+    (0.36, 0.40),   # subcritical, liquid-side of rho*_c
+    (0.39, 0.35),   # approaching T_c from below
+    (0.41, 0.30),   # close to T_c, gas-side
+    (0.41, 0.40),   # close to T_c, liquid-side
+    (0.43, 0.35),   # just below T_c — critical fluctuations
+    (0.45, 0.35),   # near/at T_c — borderline
+    (0.50, 0.35),   # above T_c — single-phase control
+]
 
 # Single-particle move counts [A3]
-# 20K hot = 625 sweeps; 50K cold = 1562 sweeps; 50K prod = 1562 sweeps
-_B_N_HOT   = 20_000
-_B_N_COLD  = 50_000
-_B_N_PROD  = 50_000
-_B_SAVE_EV = 200      # save every 200 moves → 250 samples/chain
+# N=64: 5K gentle warmup = 78 sweeps; 100K cold = 1562 sweeps; 100K prod = 1562 sweeps
+# Liquid-init: brief gentle warmup at 0.8*beta to relax lattice defects only.
+# Gas-init:    skip warmup entirely — uniform lattice has no structural artifacts.
+_B_N_HOT   = 5_000
+_B_N_COLD  = 100_000
+_B_N_PROD  = 100_000
+_B_SAVE_EV = 200      # save every 200 moves → 500 samples/chain
 _B_N_CHAINS = 8       # per init type
 
 
 def stage_b(N, D, r_cut, out_dir, key, seed):
-    """Coarse (T*, rho*) sweep to locate the coexistence region.
+    """Focused (T*, rho*) sweep to locate the coexistence region.
 
-    For each of 60 grid points: auto-calibrate step_size, run 8 liquid-init +
-    8 gas-init chains, compute OP gap, classify COEXISTENCE / UNCLEAR /
-    SINGLE PHASE.
+    For each of the literature-informed grid points: auto-calibrate step_size,
+    run 8 liquid-init (with hot equil) + 8 gas-init (cold-only) chains, compute
+    OP gap, classify COEXISTENCE / UNCLEAR / SINGLE PHASE.
+
+    Gas-init chains skip hot equilibration so the dispersed starting condition
+    is preserved into the cold equilibration phase.
 
     [A3] All move counts are single-particle moves.
     """
     print(f"\n{'='*60}")
-    print(f"Stage B: Coarse sweep  ({len(T_LIST)}×{len(RHO_LIST)} = "
-          f"{len(T_LIST)*len(RHO_LIST)} grid points)")
-    print(f"  Per point: {_B_N_CHAINS} liq-init + {_B_N_CHAINS} gas-init chains")
-    print(f"  Moves: {_B_N_HOT} hot + {_B_N_COLD} cold + {_B_N_PROD} prod "
+    print(f"Stage B: Focused sweep  ({len(GRID_POINTS)} literature-informed grid points)")
+    print(f"  Per point: {_B_N_CHAINS} liq-init (hot+cold) + {_B_N_CHAINS} gas-init (prod only)")
+    print(f"  Liq moves: {_B_N_HOT} hot + {_B_N_COLD} cold + {_B_N_PROD} prod "
           f"({_B_N_PROD//_B_SAVE_EV} samples/chain)")
+    print(f"  Gas moves: 0 cold + {_B_N_PROD} prod (starts dispersed, OP≈0)")
     print(f"{'='*60}")
 
     coarse_dir = os.path.join(out_dir, 'coarse_sweep')
@@ -236,81 +345,90 @@ def stage_b(N, D, r_cut, out_dir, key, seed):
     best_T = None
     best_rho = None
 
-    for T_star in T_LIST:
-        for rho_star in RHO_LIST:
-            beta = 1.0 / T_star
-            L = float(np.sqrt(N / rho_star))
-            energy_fn = _make_lj(N, D, L)
+    for T_star, rho_star in GRID_POINTS:
+        beta = 1.0 / T_star
+        L = float(np.sqrt(N / rho_star))
+        energy_fn = _make_lj(N, D, L)
 
-            print(f"  T*={T_star:.2f}  rho*={rho_star:.2f}  L={L:.3f}  ", end='', flush=True)
+        print(f"  T*={T_star:.2f}  rho*={rho_star:.2f}  L={L:.3f}  ", end='', flush=True)
 
-            # --- Step size calibration ---
-            key, k_cal = jax.random.split(key)
-            x0 = make_liquid_init(N, D, L)
-            step_size, rates = calibrate_step_size(
-                x0[None], energy_fn, beta, N, D, L, k_cal,
-                candidates=(0.05, 0.1, 0.2, 0.4), n_test=1000)
+        # --- Step size calibration ---
+        key, k_cal = jax.random.split(key)
+        x0 = make_liquid_init(N, D, L)
+        step_size, rates = calibrate_step_size(
+            x0[None], energy_fn, beta, N, D, L, k_cal,
+            candidates=(0.05, 0.1, 0.2, 0.4), n_test=1000)
 
-            # --- Build initial configs ---
-            key, k_liq, k_gas = jax.random.split(key, 3)
-            liq_inits = _build_init_batch(make_liquid_init, _B_N_CHAINS, N, D, L, k_liq)
-            gas_inits = _build_init_batch(make_gas_init,    _B_N_CHAINS, N, D, L, k_gas)
+        # --- Build initial configs ---
+        # Gas-init: dispersed lattice with spacing > r_cut → OP = 1/N = isolated.
+        # This is robust for all N; make_gas_init (full-box lattice) can have
+        # spacing < r_cut at some N values (e.g. N=128), giving OP=1.0 instead.
+        key, k_liq, k_gas = jax.random.split(key, 3)
+        liq_inits = _build_init_batch(make_liquid_init, _B_N_CHAINS, N, D, L, k_liq)
+        gas_keys = jax.random.split(k_gas, _B_N_CHAINS)
+        gas_inits = jnp.stack([
+            _make_gas_init_dispersed(N, D, L, r_cut, rng_key=k)
+            for k in gas_keys])
 
-            # --- Run chains ---
-            key, k1, k2 = jax.random.split(key, 3)
-            samp_liq = _run_chains(liq_inits, energy_fn, beta, step_size,
-                                   _B_N_HOT, _B_N_COLD, _B_N_PROD, _B_SAVE_EV,
-                                   N, D, L, k1)  # (n_saves, n_chains, N*D)
-            samp_gas = _run_chains(gas_inits, energy_fn, beta, step_size,
-                                   _B_N_HOT, _B_N_COLD, _B_N_PROD, _B_SAVE_EV,
-                                   N, D, L, k2)
+        # --- Run chains ---
+        # Liquid-init: brief gentle warmup (0.8*beta) to relax lattice defects.
+        # Gas-init: NO hot equil, NO cold equil — production starts immediately
+        #   from the dispersed triangular lattice (OP≈0.016).  This ensures the
+        #   early production samples capture the gas-like state before nucleation.
+        key, k1, k2 = jax.random.split(key, 3)
+        samp_liq = _run_chains(liq_inits, energy_fn, beta, step_size,
+                               _B_N_HOT, _B_N_COLD, _B_N_PROD, _B_SAVE_EV,
+                               N, D, L, k1, skip_hot_equil=False)
+        samp_gas = _run_chains(gas_inits, energy_fn, beta, step_size,
+                               _B_N_HOT, 0, _B_N_PROD, _B_SAVE_EV,
+                               N, D, L, k2, skip_hot_equil=True)
 
-            # Flatten: (n_saves*n_chains, N*D)
-            flat_liq = samp_liq.reshape(-1, N * D)
-            flat_gas = samp_gas.reshape(-1, N * D)
+        # Flatten: (n_saves*n_chains, N*D)
+        flat_liq = samp_liq.reshape(-1, N * D)
+        flat_gas = samp_gas.reshape(-1, N * D)
 
-            op_liq = compute_op_batch(flat_liq, N, D, L, r_cut)
-            op_gas = compute_op_batch(flat_gas, N, D, L, r_cut)
+        op_liq = compute_op_batch(flat_liq, N, D, L, r_cut)
+        op_gas = compute_op_batch(flat_gas, N, D, L, r_cut)
 
-            mean_op_liq = float(op_liq.mean())
-            mean_op_gas = float(op_gas.mean())
-            op_gap = abs(mean_op_liq - mean_op_gas)
+        mean_op_liq = float(op_liq.mean())
+        mean_op_gas = float(op_gas.mean())
+        op_gap = abs(mean_op_liq - mean_op_gas)
 
-            if op_gap > 0.4:
-                classification = 'COEXISTENCE'
-            elif op_gap < 0.1:
-                classification = 'SINGLE_PHASE'
-            else:
-                classification = 'UNCLEAR'
+        if op_gap > 0.4:
+            classification = 'COEXISTENCE'
+        elif op_gap < 0.1:
+            classification = 'SINGLE_PHASE'
+        else:
+            classification = 'UNCLEAR'
 
-            print(f"OP_liq={mean_op_liq:.3f}  OP_gas={mean_op_gas:.3f}  "
-                  f"gap={op_gap:.3f}  → {classification}")
+        print(f"OP_liq={mean_op_liq:.3f}  OP_gas={mean_op_gas:.3f}  "
+              f"gap={op_gap:.3f}  → {classification}")
 
-            rows.append({
-                'T_star': T_star, 'rho_star': rho_star, 'L': round(L, 4),
-                'step_size': step_size,
-                'mean_op_liq': round(mean_op_liq, 4),
-                'mean_op_gas': round(mean_op_gas, 4),
-                'op_gap': round(op_gap, 4),
-                'classification': classification,
-            })
+        rows.append({
+            'T_star': T_star, 'rho_star': rho_star, 'L': round(L, 4),
+            'step_size': step_size,
+            'mean_op_liq': round(mean_op_liq, 4),
+            'mean_op_gas': round(mean_op_gas, 4),
+            'op_gap': round(op_gap, 4),
+            'classification': classification,
+        })
 
-            if op_gap > best_op_gap:
-                best_op_gap = op_gap
-                best_T = T_star
-                best_rho = rho_star
+        if op_gap > best_op_gap:
+            best_op_gap = op_gap
+            best_T = T_star
+            best_rho = rho_star
 
-            # Save diagnostic plots for classified coexistence points
-            if classification == 'COEXISTENCE':
-                tag = f'T{T_star:.2f}_rho{rho_star:.2f}'
-                multi_panel_diagnostic(
-                    flat_liq[:200], N, D, L, r_cut, energy_fn,
-                    title=f'Liq-init  T*={T_star} ρ*={rho_star} {classification}',
-                    save_path=os.path.join(coarse_dir, f'{tag}_liq.png'))
-                multi_panel_diagnostic(
-                    flat_gas[:200], N, D, L, r_cut, energy_fn,
-                    title=f'Gas-init  T*={T_star} ρ*={rho_star} {classification}',
-                    save_path=os.path.join(coarse_dir, f'{tag}_gas.png'))
+        # Save diagnostic plots for classified coexistence points
+        if classification == 'COEXISTENCE':
+            tag = f'T{T_star:.2f}_rho{rho_star:.2f}'
+            multi_panel_diagnostic(
+                flat_liq[:200], N, D, L, r_cut, energy_fn,
+                title=f'Liq-init  T*={T_star} ρ*={rho_star} {classification}',
+                save_path=os.path.join(coarse_dir, f'{tag}_liq.png'))
+            multi_panel_diagnostic(
+                flat_gas[:200], N, D, L, r_cut, energy_fn,
+                title=f'Gas-init  T*={T_star} ρ*={rho_star} {classification}',
+                save_path=os.path.join(coarse_dir, f'{tag}_gas.png'))
 
     # --- Save summary CSV ---
     csv_path = os.path.join(coarse_dir, 'summary.csv')
@@ -347,8 +465,8 @@ def stage_b(N, D, r_cut, out_dir, key, seed):
 # ---------------------------------------------------------------------------
 
 # Single-particle move counts [A3]
-# 30K hot = 937 sweeps; 100K cold = 3125 sweeps; 200K prod = 6250 sweeps
-_C_N_HOT   = 30_000
+# 5K gentle warmup at 0.8*beta (liq-init only); 100K cold; 200K prod
+_C_N_HOT   = 5_000
 _C_N_COLD  = 100_000
 _C_N_PROD  = 200_000
 _C_SAVE_EV = 100      # save every 100 moves → 2000 samples/chain
@@ -361,14 +479,25 @@ def stage_c(N, D, rho_best, r_cut, out_dir, key, coarse_rows):
     12 temperatures ΔT*=0.01 centred on the coarse-sweep coexistence range.
     Selects T_coex = T maximising Ashman's D with both phases metastable.
     """
-    # Find the coexistence temperature range from Stage B
+    # Find the coexistence temperature range from Stage B.
+    # If Stage B finds COEXISTENCE only at T* well below T_c (< 0.38), those
+    # points reflect transient gas-phase sampling before nucleation, not true
+    # metastability.  In that case anchor Stage C on the literature T_c estimate
+    # (0.44) so the fine sweep covers the physically relevant T range.
     coex_rows = [r for r in coarse_rows
                  if r['rho_star'] == rho_best and r['classification'] == 'COEXISTENCE']
     if not coex_rows:
         coex_rows = [r for r in coarse_rows if r['rho_star'] == rho_best]
         coex_rows.sort(key=lambda r: -r['op_gap'])
 
-    T_centre = coex_rows[0]['T_star'] if coex_rows else 0.40
+    best_T_b = coex_rows[0]['T_star'] if coex_rows else 0.44
+    if best_T_b < 0.38:
+        # Best Stage B point is deeply subcritical; use literature T_c anchor.
+        T_centre = 0.44
+        print(f"  [Stage C] Stage B best T*={best_T_b:.2f} < 0.38 — anchoring on "
+              f"literature T_c=0.44 to sweep the critical region.")
+    else:
+        T_centre = best_T_b
     T_list_fine = [round(T_centre - 0.05 + i * 0.01, 3) for i in range(12)]
 
     print(f"\n{'='*60}")
@@ -403,15 +532,18 @@ def stage_c(N, D, rho_best, r_cut, out_dir, key, coarse_rows):
         # Build and run chains
         key, k_liq, k_gas = jax.random.split(key, 3)
         liq_inits = _build_init_batch(make_liquid_init, _C_N_CHAINS, N, D, L, k_liq)
-        gas_inits = _build_init_batch(make_gas_init,    _C_N_CHAINS, N, D, L, k_gas)
+        gas_keys_c = jax.random.split(k_gas, _C_N_CHAINS)
+        gas_inits = jnp.stack([
+            _make_gas_init_dispersed(N, D, L, r_cut, rng_key=k)
+            for k in gas_keys_c])
 
         key, k1, k2 = jax.random.split(key, 3)
         samp_liq = _run_chains(liq_inits, energy_fn, beta, step_size,
                                _C_N_HOT, _C_N_COLD, _C_N_PROD, _C_SAVE_EV,
-                               N, D, L, k1)
+                               N, D, L, k1, skip_hot_equil=False)
         samp_gas = _run_chains(gas_inits, energy_fn, beta, step_size,
-                               _C_N_HOT, _C_N_COLD, _C_N_PROD, _C_SAVE_EV,
-                               N, D, L, k2)
+                               _C_N_HOT, 0, _C_N_PROD, _C_SAVE_EV,
+                               N, D, L, k2, skip_hot_equil=True)
 
         # (n_saves, n_chains, N*D) → flatten chains, keep time axis
         # op_liq_series: (n_saves, n_chains)
@@ -559,14 +691,17 @@ def stage_d(N, D, T_coex, rho_best, r_cut, out_dir, key):
         liq_inits = _build_init_batch(make_liquid_init, n_liq, N, D, L, k_liq)
         gas_inits = _build_init_batch(make_gas_init,    n_gas, N, D, L, k_gas)
 
-        # For Stage D, combine equil into a single MCMC call
-        def _run_d(inits, k):
+        # Stage D: T_base is above T_c (ergodic), so both inits should converge.
+        # Liquid-init: brief gentle warmup at 0.8*beta to relax lattice.
+        # Gas-init: cold equil only.
+        def _run_d(inits, k, skip_hot=False):
             cfgs = jnp.array(inits)
             k, k1 = jax.random.split(k)
-            cfgs, _ = run_mcmc(cfgs, energy_fn, 0.2 * beta, _D_N_EQUIL // 2,
-                               k1, step_size, L, N, D)
+            if not skip_hot:
+                cfgs, _ = run_mcmc(cfgs, energy_fn, 0.8 * beta, 5_000,
+                                   k1, step_size, L, N, D)
             k, k2 = jax.random.split(k)
-            cfgs, _ = run_mcmc(cfgs, energy_fn, beta, _D_N_EQUIL // 2,
+            cfgs, _ = run_mcmc(cfgs, energy_fn, beta, _D_N_EQUIL,
                                k2, step_size, L, N, D)
             samples = []
             for _ in range(_D_N_PROD // _D_SAVE_EV):
@@ -577,8 +712,8 @@ def stage_d(N, D, T_coex, rho_best, r_cut, out_dir, key):
             return np.stack(samples)   # (n_saves, n_chains, N*D)
 
         key, k1, k2 = jax.random.split(key, 3)
-        samp_liq = _run_d(liq_inits, k1)
-        samp_gas = _run_d(gas_inits, k2)
+        samp_liq = _run_d(liq_inits, k1, skip_hot=False)
+        samp_gas = _run_d(gas_inits, k2, skip_hot=True)
 
         flat_liq = samp_liq.reshape(-1, N * D)
         flat_gas = samp_gas.reshape(-1, N * D)
@@ -893,7 +1028,7 @@ def main():
     parser.add_argument('--out-dir', default='experiments/calibration',
                         help='Output directory')
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--n-particles', type=int, default=32)
+    parser.add_argument('--n-particles', type=int, default=128)
     parser.add_argument('--stage', choices=['A', 'B', 'C', 'D', 'E', 'all'],
                         default='all',
                         help='Run a specific stage or all (default)')

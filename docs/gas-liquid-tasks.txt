@@ -1,0 +1,352 @@
+================================================================================
+PLAN: Flow-Augmented MCMC for 2D LJ Liquid-Gas Phase Coexistence
+================================================================================
+
+GOAL: Train a normalizing flow mapping warm single-phase LJ fluid (base) →
+cold LJ at liquid-gas coexistence (target). Use trained flow as nonlocal MCMC
+proposal to accelerate mixing between liquid and gas phases.
+
+DO NOT MODIFY existing files. Duplicate and adapt:
+  config.py → coex_config.py | jax_pipeline.py → coex_pipeline.py | train.py → coex_train.py
+  Import from physics.py and lorenzo_models/* without modification.
+
+
+PITFALLS (reference as [A1]-[A5] throughout):
+  [A1] use_lrc=False EVERYWHERE. LRC assumes uniform density; breaks at coexistence.
+  [A2] loss_zx biases toward liquid (lower energy). Use w_xz≥2.0, w_zx=1.0.
+       Monitor mode collapse every 10 epochs during training.
+  [A3] One codebase "sweep" = one particle move, NOT a full pass. Full pass = N moves.
+  [A4] Derive r_cut for cluster OP from g(r) first minimum. Don't assume 1.5σ.
+  [A5] Unit-test flow invertibility before MCMC: |flow⁻¹(flow(z)) - z| < 1e-4
+       and |logdet_fwd + logdet_inv| < 1e-4 on 100 samples from both datasets.
+
+
+LITERATURE: 2D LJ CRITICAL POINT
+---------------------------------
+  Source                          Potential              T*_c     ρ*_c
+  ──────────────────────────────  ─────────────────────  ───────  ──────
+  Smit & Frenkel 1991            Full LJ                0.533    0.355
+  Smit & Frenkel 1991            Trunc 2.5σ + shifted   0.459    —
+  Panagiotopoulos 1994           Full LJ 2D             0.498    0.360
+  Ouyang et al. 2011             Trunc 2.5σ + shifted   0.457    ~0.37
+  Ouyang et al. 2011 (fin. size) Trunc 2.5σ + shifted   ~0.44    —
+  Jiang & Gubbins 1995           Full LJ (large r_cut)  ~0.50    ~0.36
+  Wilding & Bruce 1992           r_cut = 2.0σ           ~0.44    —
+
+Key insight from Smit & Frenkel: "the critical temperature depends LARGELY on
+the details of the truncation. These differences are by no means small."
+
+Our code: lj_energy default cutoff=2.5σ, shifted to zero at cutoff, no LRC [A1].
+  → T*_c ≈ 0.44–0.46 (consistent with Smit & Frenkel trunc+shifted and Wilding).
+  → For N=64, finite-size shift is modest: T*_c,eff ≈ 0.43–0.45.
+  → ρ*_c ≈ 0.35 is robust across all sources.
+
+CLARIFICATION — two distinct r_cut values in the code (do NOT confuse):
+  [1] LJ interaction cutoff: 2.5σ, hardcoded default in lj_energy(cutoff=2.5).
+      This is a physics modelling choice, fixed independently of g(r).
+  [2] Cluster OP neighbour cutoff: ~1.46σ, derived from g(r) first minimum
+      in Stage A. Used only in compute_op_batch / largest_cluster_fraction.
+  Stage A computes [2] only. The energy function always uses [1]=2.5σ.
+
+Well below T_c, coexistence densities (r_cut=2.5σ, no LRC):
+  Liquid branch: ρ*_liq ≈ 0.52–0.68  (T*=0.30–0.43)
+  Gas branch:    ρ*_gas ≈ 0.02–0.10  (T*=0.30–0.43)
+  Average ρ ≈ 0.30–0.40 → system sits in the two-phase region.
+
+TARGET OPERATING POINT:
+  T_coex ≈ 0.30–0.43 (well below T_c for strong bimodality)
+  ρ_avg ≈ 0.35 (near critical density, straddles the coexistence gap)
+
+LESSONS FROM INITIAL N=32 RUN (2025-02):
+  - Ran 27/60 grid points of the original product sweep (T*=0.30–0.42, ρ*=0.25–0.50).
+  - No COEXISTENCE signal: max OP_gap = 0.14 at (T*=0.30, ρ*=0.25), threshold 0.40.
+  - Root causes identified:
+      (a) N=32 too small: finite-size T_c shift and tiny nucleation barrier.
+          With N=32, both liquid and gas inits condense to the same large cluster.
+      (b) Hot equilibration at T*_hot=5×T*_cold destroys gas-phase initial
+          conditions; both chains start cold from an identical high-T fluid.
+  - Fix applied: N→64, focused 10-point grid, revised equilibration protocol.
+
+
+================================================================================
+PHASE 1: THERMODYNAMIC CALIBRATION
+================================================================================
+
+STEP 1: CREATE diagnostics.py — measurement and visualization toolkit  [DONE]
+----------------------------------------------------------------------
+All functions respect PBC via minimum image: dr = dr - L*round(dr/L).
+
+1a) radial_distribution_function(coords, N, D, L, n_bins=100):
+      g(r) for all N*(N-1)/2 pairs. 2D normalization: g(r) = hist / (N*ρ*2π*r*dr).
+      r_max = L/2. Return (r_values, g_r_values).
+
+1b) find_rcut_from_gr(r_vals, gr_vals, r_min=1.0, r_max=2.0):
+      First minimum of g(r) in [r_min, r_max]. [A4]
+      If no clear minimum, return 1.5 with WARNING.
+
+1c) largest_cluster_fraction(coords, N, D, L, r_cut):
+      Min-image pairwise distances → adjacency (d < r_cut) →
+      scipy.sparse.csgraph.connected_components → max_component / N.
+
+1d) mean_coordination(coords, N, D, L, r_cut):
+      Average neighbors per particle within r_cut.
+
+1e) potential_energy_per_particle(coords, energy_fn, energy_config):
+      U(x) / N. Use lj_energy with use_lrc=False [A1].
+
+1f) snapshot_plot(coords, N, D, L, r_cut=None, title="", save_path=None):
+      2D scatter in [-L/2, L/2]². Color by cluster if r_cut given. Draw bonds.
+
+1g) multi_panel_diagnostic(configs_batch, N, D, L, r_cut, energy_fn,
+                            energy_config, title, save_path):
+      Single figure: 4 snapshots + OP histogram + energy histogram + g(r).
+
+1h) make_liquid_init(N, D, L, rng_key=None):
+      Tight triangular lattice near origin, spacing ~1.12σ, noise ~0.05σ.
+      Particle 0 at (0,0). Wrap PBC. VERIFY: lj_energy finite and negative.
+
+1i) make_gas_init(N, D, L, rng_key=None):
+      Lattice spanning full box, spacing L/ceil(√N), noise ~0.1σ.
+      Particle 0 at (0,0). VERIFY: energy near zero.
+
+
+STEP 2: CREATE calibrate_coex.py — systematic sweep  [DONE, revised]
+----------------------------------------------------------------------
+All energy: lj_energy, use_lrc=False [A1].
+All step counts = single-particle moves [A3]. Report as full sweeps (÷N).
+N=64 throughout (increased from 32 after initial run showed no coexistence).
+
+STAGE A — Determine r_cut:  [DONE]
+  Result: r_cut = 1.4582σ from g(r) first minimum at T*=0.42, ρ*=0.35.
+  Saved: experiments/calibration/stage_a_rcut.json, stage_a_gr.png
+  Note: this is the CLUSTER OP neighbour cutoff only. LJ energy uses 2.5σ.
+  Protocol: T*=0.42, ρ*=0.35 (L=√(64/0.35)≈13.52), liquid init.
+  60K moves. g(r) from last 30K (sample every 300).
+
+STAGE B — Focused sweep:  [IN PROGRESS → restarting with N=64]
+  Literature-informed 10-point grid (2D LJ, cutoff=2.5σ, T*_c≈0.44–0.46):
+
+    GRID_POINTS = [
+      (T*=0.30, ρ*=0.35),   # deep subcritical, near ρ*_c
+      (T*=0.33, ρ*=0.35),   # subcritical
+      (T*=0.36, ρ*=0.30),   # subcritical, gas-side
+      (T*=0.36, ρ*=0.40),   # subcritical, liquid-side
+      (T*=0.39, ρ*=0.35),   # approaching T_c
+      (T*=0.41, ρ*=0.30),   # close to T_c, gas-side
+      (T*=0.41, ρ*=0.40),   # close to T_c, liquid-side
+      (T*=0.43, ρ*=0.35),   # just below T_c — critical fluctuations
+      (T*=0.45, ρ*=0.35),   # near/at T_c
+      (T*=0.50, ρ*=0.35),   # above T_c — single-phase control
+    ]
+
+  Per grid point:
+    - Auto-calibrate step_size: test [0.05, 0.1, 0.2, 0.4]σ, pick ~35% acceptance.
+    - 8 chains liquid init + 8 chains gas init.
+    EQUILIBRATION PROTOCOL (paper-informed):
+    - The paper (Stimper et al.) starts walkers directly in their respective
+      phases with NO hot equilibration. At coexistence, gas and liquid are
+      metastable — local MCMC cannot cross between them. This metastability
+      is the feature being tested, not a bug to work around.
+    - Hot equil at 0.2*beta (5×T_cold) puts the system into the supercritical
+      regime, erasing all phase memory. Both inits then re-nucleate randomly,
+      defeating the hysteresis test entirely.
+    - Liquid-init: brief gentle warmup at 0.8*beta (1.25×T_cold), 5K moves
+      only — sufficient to relax triangular lattice defects, not enough to
+      destroy phase identity.
+    - Gas-init: NO warmup at all. Uniform lattice is a valid gas-phase start;
+      cold equil alone is sufficient.
+    - Save OP every 200 production moves → 500 samples/chain.
+    - Compute: <OP>_liq_init, <OP>_gas_init, OP_gap = |<OP>_liq - <OP>_gas|.
+    - multi_panel_diagnostic for COEXISTENCE points.
+
+  Auto-classify:
+    COEXISTENCE: OP_gap > 0.4
+    SINGLE PHASE: OP_gap < 0.1
+    UNCLEAR: otherwise
+
+  Output:
+    - experiments/calibration/coarse_sweep/summary.csv
+    - Phase diagram scatter: (ρ*, T*) colored by classification
+    - Diagnostic plots for COEXISTENCE points
+
+STAGE C — Fine temperature sweep at best density:
+  Pick ρ_best = density with max OP_gap from coarse sweep.
+  Fine grid: 12 temperatures, ΔT*=0.01, centered on the coexistence range.
+
+  Per temperature:
+    - 16 chains liquid init + 16 chains gas init.
+    - 20K hot equil + 50K cold equil + 100K production.
+    - Save OP every 100 production moves → 1000 samples/chain.
+
+  Per temperature:
+    i)   OP time series, all 32 chains (red=liq-init, blue=gas-init).
+    ii)  Ashman's D on combined OP histogram:
+         D = |μ₁ - μ₂| / √((σ₁² + σ₂²)/2).  D > 2 = clean bimodality.
+         Fit with sklearn.mixture.GaussianMixture(n_components=2).
+    iii) Spontaneous transition count (OP crossings through midpoint).
+    iv)  g(r) from liquid-init and gas-init chains separately.
+
+  Select T_coex = T maximizing Ashman's D where both phases metastable.
+  If NO temperature has OP_gap > 0.3: increase N to 64, rerun.
+  Save to experiments/calibration/fine_sweep/
+
+STAGE D — Verify and select T_base:
+  At ρ_best, test: [T_coex+0.10, T_coex+0.20, T_coex+0.30, 0.80]
+  16 chains (8 liq + 8 gas init), 20K equil + 50K production.
+  Require: both inits → same OP distribution (KS test p > 0.05),
+  unimodal OP (Ashman's D < 1.5).
+  Choose LOWEST T_base that passes.
+
+STAGE E — Visual gallery (PDF):
+  Page 1: Phase diagram, (T_coex, ρ_best) and (T_base, ρ_best) marked.
+  Page 2: Base — 4 snapshots, OP hist (unimodal), energy hist, g(r).
+  Page 3: Target liquid — snapshots, histograms, g(r).
+  Page 4: Target gas — same.
+  Page 5: Coexistence — bimodal OP, OP time series, Ashman's D.
+  Page 6: T dependence — OP histograms cold → hot at ρ_best.
+  Page 7: Summary table.
+
+  ╔═══════════════════════════════════════════════════════════════╗
+  ║ STOP. Review gallery. Confirm parameters before proceeding.  ║
+  ╚═══════════════════════════════════════════════════════════════╝
+
+
+================================================================================
+PHASE 2: DATA GENERATION
+================================================================================
+
+STEP 3: CREATE generate_coex_data.py
+--------------------------------------
+Uses confirmed T_base, T_coex, ρ_best, L_best. All: lj_energy, use_lrc=False [A1].
+
+base_configs.npy (1M):
+  MCMC at 1/T_base, L_best. Init from fcc_lattice.
+  20K hot + 50K cold + 5K production [A3].
+  VERIFY: 1000 random → OP unimodal, 10 snapshots look like fluid.
+
+target_configs.npy (1M):
+  500K from liquid init at beta_target. 20K hot + 50K cold + 5K production.
+    VERIFY: 100 samples → OP > 0.6.
+  500K from gas init, same protocol.
+    VERIFY: 100 samples → OP < 0.4.
+  Concatenate, shuffle.
+  VERIFY combined: OP histogram bimodal.
+
+Save to data/coex/.
+
+
+================================================================================
+PHASE 3: PIPELINE & TRAINING
+================================================================================
+
+STEP 4: CREATE coex_config.py, coex_pipeline.py, coex_train.py
+-----------------------------------------------------------------
+coex_config.py — duplicate config.py, modify:
+  - SystemConfig: box_length=L_best, n_particles=32, dimensions=2
+  - EnergyConfig: use_lrc=False [A1]
+  - PipelineConfig: beta_base, beta_target, w_xz=2.0, w_zx=1.0 [A2]
+
+coex_pipeline.py — duplicate jax_pipeline.py, ~15 lines changed:
+  1. Import from coex_config
+  2. loss_xz: wca_energy → lj_energy, beta_wca → config.beta_base
+  3. loss_zx: beta_lj → config.beta_target
+  4. Combined: total = config.w_xz * loss_xz + config.w_zx * loss_zx
+  5. DynamicPrior: wca_energy → lj_energy, beta → config.beta_base
+  6. compute_val_metrics: same substitutions
+     ADD mode collapse check [A2]: every 10 epochs push 500 base samples
+     through flow → compute OP → log fraction in each phase. Warn if <10%
+     in minority mode. Import largest_cluster_fraction from diagnostics.py.
+  7. load_or_generate_data: filenames → base/target_configs.npy
+
+coex_train.py — duplicate train.py:
+  Import from coex_config, coex_pipeline.
+  CLI: --beta-base, --beta-target, --box-length, --w-xz, --w-zx, --data-dir.
+
+
+STEP 5: TRAIN
+--------------
+  python coex_train.py \
+    --beta-base {1/T_base} --beta-target {1/T_coex} \
+    --box-length {L_best} --w-xz 2.0 --w-zx 1.0 \
+    --data-dir ./data/coex/ --n-samples 1000000
+
+  Monitor: RESS > 0.01, mode collapse check, snapshot plots every 50 epochs.
+
+  Fallback if mode collapse:
+    1. w_xz=5.0, w_zx=0.5
+    2. Pure NLL: w_xz=1.0, w_zx=0.0
+    3. Increase n_blocks 8→12
+
+
+================================================================================
+PHASE 4: FLOW-AUGMENTED MCMC
+================================================================================
+
+STEP 6: CREATE flow_augmented_mcmc.py
+---------------------------------------
+6a) MANDATORY CHECKS [A5]:
+
+  verify_flow_invertibility(flow, params, test_configs, atol=1e-4):
+    100 configs from both datasets:
+      z, ld_inv = flow.inverse(x); x_rec, ld_fwd = flow.forward(z)
+      assert max|x - x_rec| < atol per coord
+      assert |ld_inv + ld_fwd| < atol
+    ABORT if fails.
+
+  check_flow_samples(flow, params, base_samples, energy_config, r_cut, n=500):
+    Push through flow. Report finite-energy fraction, overlap fraction,
+    OP histogram, 10 snapshots. ABORT if >50% overlaps.
+
+6b) Flow proposal:
+  Current x, propose y = flow(z_new) with z_new ~ base_cache:
+
+    z_cur, logdet_inv_cur = flow.inverse(x)
+    y, logdet_fwd_new = flow.forward(z_new)
+
+    EARLY REJECT if any pair in y < 0.7σ.
+
+    log_acc = [-β_target*U(y) + (-β_base*U(z_cur) + logdet_inv_cur)]
+            - [-β_target*U(x) + (-β_base*U(z_new) - logdet_fwd_new)]
+
+    Accept with min(1, exp(log_acc)). All U() = lj_energy, use_lrc=False [A1].
+
+6c) Main loop:
+  run_flow_augmented_mcmc(flow, params, energy_config, beta_base, beta_target,
+      base_cache, x_init, n_cycles, k_local_sweeps, step_size, rng_key):
+
+    Per cycle: local_mcmc_block(k_local_sweeps × N moves [A3]) + flow_proposal.
+    Record OP, energy, accepted every 10 cycles.
+
+6d) Baseline:
+  run_plain_mcmc(...) — same interface, no flow proposals.
+
+
+STEP 7: CREATE run_comparison.py
+----------------------------------
+  Load flow, verify invertibility, check samples. base_cache = 100K samples.
+  64 chains: 32 liquid init + 32 gas init.
+
+  Flow-augmented: 5000 cycles × k_local_sweeps=3 (96 moves/cycle).
+  Also test k_local_sweeps ∈ {1, 10, 30}.
+  Plain MCMC: 15K full sweeps (same total local work).
+
+  Metrics: transition count, autocorrelation time, ESS, flow acceptance rate,
+  time to first transition, wall-clock per ESS.
+
+
+STEP 8: CREATE visualize_results.py
+-------------------------------------
+  a) OP time series: flow-augmented vs plain, red=liq blue=gas init.
+  b) OP histograms (bimodal vs stuck).
+  c) Acceptance vs k_local_sweeps.
+  d) Snapshot gallery at various OP values.
+  e) Summary metrics table.
+
+
+================================================================================
+FILES (creation order)
+================================================================================
+  1. diagnostics.py           2. calibrate_coex.py      3. generate_coex_data.py
+  4. coex_config.py           5. coex_pipeline.py       6. coex_train.py
+  7. flow_augmented_mcmc.py   8. run_comparison.py      9. visualize_results.py
+================================================================================

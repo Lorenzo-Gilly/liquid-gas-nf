@@ -1,0 +1,1023 @@
+TRAINING INSIGHT: Complete Reproducible Breakdown of the Training Pipeline
+==========================================================================
+
+This document describes EXACTLY how training works in this codebase, from
+data generation through to a trained flow, with every numerical detail
+spelled out. Intended as supplemental material you can diff against your
+own implementation to find discrepancies.
+
+==========================================================================
+TABLE OF CONTENTS
+==========================================================================
+ 1. Physical System Specification
+ 2. Training Data Generation (MCMC)
+ 3. Data Preprocessing and Augmentation
+ 4. Flow Architecture (Exact Specification)
+ 5. Weight Initialization
+ 6. Dynamic Prior (Live Sampling During Training)
+ 7. The Training Loop (Exact Procedure)
+ 8. Loss Functions (Mathematical Derivation)
+ 9. Optimizer and Learning Rate Schedule
+10. Coordinate System and Transformations
+11. Energy Computation and Numerical Safeguards
+12. Things That Can Silently Break Your Training
+13. Diagnostic Checklist
+
+==========================================================================
+1. PHYSICAL SYSTEM SPECIFICATION
+==========================================================================
+
+System A (Source/Prior): WCA potential
+  - n_particles = 32
+  - dimensions = 2
+  - box_length = 6.6 (both x and y, square box)
+  - rho = 32 / 6.6^2 = 0.7346189164370983
+  - T = 2, beta = 0.5
+  - cutoff = 2^(1/6) * sigma = 1.1224620... (WCA cutoff, purely repulsive)
+  - cutin = 0.8 (energy linearized below this distance)
+  - epsilon = 1, sigma = 1 (standard reduced units)
+  - lrc = False (no long-range corrections for WCA)
+  - tol = 1e-12
+
+System B (Target/Posterior): Full Lennard-Jones potential
+  - n_particles = 32
+  - dimensions = 2
+  - box_length = 6.6 (same as source)
+  - rho = 0.7346189164370983 (same as source)
+  - T = 1, beta = 1.0
+  - cutoff = min(2.5*sigma, 0.49*min_box_dim) = min(2.5, 0.49*6.6) = 2.5
+  - cutin = 0.8 (same linearization)
+  - epsilon = 1, sigma = 1
+  - lrc = True (long-range corrections applied)
+  - tol = 1e-12
+
+Density scaling factor: scale = (rho_source/rho_target)^(1/dim) = 1.0
+  --> Same density, so no box rescaling needed.
+
+Degrees of freedom: n_particles * dimensions = 64
+After removing particle 0 (origin): 31 * 2 = 62 DOFs pass through the flow.
+
+Box length tensor: torch.tensor([6.6, 6.6]) on GPU.
+  NOTE: The box_length is computed from the density and lattice parameters,
+  not directly from the input 6.6. The actual computation:
+    n_elem["FCC"] = 2
+    a = (2/rho)^(1/2)
+    n = ceil((32/2)^(1/2)) = ceil(4) = 4
+    L = 4 * a * [1, 1]
+    V = L[0] * L[1]
+    s = ((32/V) / (2*16/V))^(1/2) = (32/V / 32/V)^(1/2) = 1.0
+    box_length = s * L
+  Verify: rho_computed = 32 / box_length.prod() should match input rho.
+
+==========================================================================
+2. TRAINING DATA GENERATION (MCMC)
+==========================================================================
+
+Both source and target datasets are generated via Metropolis Monte Carlo.
+
+MCMC Parameters:
+  - step_size = 0.2 (max displacement per particle per move)
+  - n_equilibration = 5000 (Metropolis cycles for equilibration)
+  - n_cycles = 1000 (Metropolis cycles for production sampling)
+  - transform = True (center particle 0 at origin, apply PBC wrapping)
+
+One Metropolis cycle:
+  - For each configuration in the batch simultaneously:
+    1. Pick ONE random particle (torch.randint)
+    2. Displace it by uniform random in [-0.2, 0.2] in each dimension
+    3. Compute energy of proposed configuration
+    4. Accept if rand() < exp(-beta * (U_new - U_old))
+    5. Apply PBC wrapping to accepted moves
+
+  KEY: Each cycle moves only ONE particle per configuration. So 1000 cycles
+  means each particle is attempted to move ~31 times on average. This is
+  NOT 1000 sweeps (a sweep = N attempted moves). The actual decorrelation
+  is modest.
+
+Data generation protocol (for EACH system, source and target):
+  Step 1: Start from FCC lattice or previous state
+  Step 2: Equilibrate at 0.2*beta (high temperature) for 5000 cycles
+          This is a HOT start -- aggressively melts the lattice.
+  Step 3: Reset equilibrated=False
+  Step 4: Equilibrate at correct beta for 5000 cycles
+  Step 5: Sample n_samples=100,000 configurations over 1000 production cycles
+          NOTE: These 100,000 configs are sampled IN PARALLEL, not sequentially.
+          Each is a separate MCMC chain running 1000 cycles from its starting point.
+  Step 6: Transform: center particle 0, apply PBC wrapping
+
+  The result is 100,000 configurations of shape (100000, 64) stored as .pt files.
+
+  A SECOND set of 100,000 "sample" configurations is also generated from the
+  same MCMC state (continuing from where production left off). These are used
+  for plotting/validation, not training.
+
+Saved files:
+  ./data/N032/wca/rho_0.73_T_2_train.pt        (100,000 WCA configs)
+  ./data/N032/wca/rho_0.73_T_2_sample.pt        (100,000 WCA configs)
+  ./data/N032/lennard-jones/rho_0.73_T_1_train.pt   (100,000 LJ configs)
+  ./data/N032/lennard-jones/rho_0.73_T_1_sample.pt   (100,000 LJ configs)
+
+Each tensor shape: (100000, 64) -- flattened [n_particles * dimensions]
+All coordinates are already in internal frame (particle 0 at origin).
+
+==========================================================================
+3. DATA PREPROCESSING AND AUGMENTATION
+==========================================================================
+
+The training data is wrapped in PBCDataset (src/normalizing_flow/dataset.py).
+
+Constructor:
+  PBCDataset(
+    flow,                          # the flow model (for system info)
+    data_tensor = lj_train,        # (100000, 64) LJ training configs
+    test_fraction = 0.1,           # 10% held out for validation
+    beta_source = 0.5,
+    beta_target = 1.0,
+    shuffle_data = False,          # NO shuffling of initial data order
+    transform = True,              # center particle 0
+    augment = True,                # apply random augmentations
+    energy_labels = LJ.energy(lj_train)  # pre-computed energies
+  )
+
+Split:
+  - Train: lj_train[:-10000] = 90,000 configurations
+  - Test:  lj_train[-10000:]  = 10,000 configurations
+  - Test z: 10,000 WCA configs from dynamic_prior.sample(10000, beta_source)
+  - Energies are pre-computed for both train and test sets
+
+__getitem__(idx) -- called for each sample during training:
+
+  WHEN augment=True (the default):
+    1. Clone the configuration: shape (32, 2)
+    2. Pick a RANDOM particle index (uniform from 0 to 31)
+    3. Center that random particle at origin:
+       train_item -= train_item[random_particle]
+    4. Apply PBC wrapping:
+       train_item -= box_length * round(train_item / box_length)
+    5. Swap the random particle to position 0:
+       train_item[[random_particle, 0]] = train_item[[0, random_particle]]
+    6. Apply random OCTAHEDRAL TRANSFORMATION:
+       - Generate random permutation of axes (e.g., swap x<->y)
+       - Generate random reflections per axis (+1 or -1)
+       - Multiply each particle's coords by this rotation/reflection matrix
+    7. Flatten back to (64,)
+
+  This augmentation is CRITICAL. It means:
+    a. The flow sees the system centered on EVERY particle, not just particle 0
+    b. The flow sees all rotations/reflections of the configuration
+    c. This dramatically increases effective training set size
+    d. It teaches the flow that physics doesn't depend on particle labeling
+       or orientation
+
+  WHEN augment=False, transform=True:
+    - Only centers particle 0 (no random particle, no octahedral transform)
+
+  WHEN both False:
+    - Returns raw data unchanged
+
+__len__() returns 90,000 (train set size).
+
+get_test_data() returns:
+  - test_data_x (10000, 64): LJ test configs
+  - energy_test_x (10000, 1): pre-computed LJ energies
+  - test_data_z (10000, 64): WCA test configs (from dynamic prior)
+  - energy_test_z (10000, 1): pre-computed WCA energies
+
+==========================================================================
+4. FLOW ARCHITECTURE (EXACT SPECIFICATION)
+==========================================================================
+
+4a. Overall structure:
+
+  Prior-sided transformations:
+    [normalize_box_prior, remove_origin]
+
+  Flow blocks (48 layers total, 8 "super-blocks"):
+    Each super-block contains 6 layers:
+      circular_shift
+      RQS_coupling_block(target=(0,))   # transforms x-coords, conditioned on y
+      RQS_coupling_block(target=(1,))   # transforms y-coords, conditioned on x
+      circular_shift
+      RQS_coupling_block(target=(1,))   # transforms y-coords, conditioned on x
+      RQS_coupling_block(target=(0,))   # transforms x-coords, conditioned on y
+
+    NOTE: Within each super-block, the order of target coordinates ALTERNATES:
+    first (x|y) then (y|x), then (y|x) then (x|y). This ensures both
+    coordinates get equally updated.
+
+  Posterior-sided transformations:
+    [normalize_box_posterior, remove_origin]
+
+4b. Data flow for F_zx (source -> target, forward):
+
+  Input: z of shape (B, 64), in physical coordinates [-L/2, L/2]
+
+  Step 1: normalize_box_pr.F_data2network(z)
+    z = z * 2 / box_length   -->  maps to [-1, 1]
+    logJ += sum(log(2/box_length)) = sum(log(2/6.6)) per sample
+    Shape: (B, 64) -> (B, 64)
+
+  Step 2: remove_origin.F_data2network(z)
+    z = z.view(B, 32, 2)[:, 1:, :]   --> removes particle 0
+    Shape: (B, 64) -> (B, 62)
+    logJ += 0
+
+  Step 3: 48 flow layers (forward order)
+    For each layer:
+      If circular_shift:
+        z.view(B, 31, 2) += learnable_shift   (shape (2,))
+        z = z - 2*round(z/2)                   (PBC wrap in [-1,1])
+        logJ += 0
+      If RQS_coupling_block(target=(0,)):
+        Split z into x-coords (31 values) and y-coords (31 values)
+        y-coords -> conditioner network -> spline parameters
+        x-coords transformed by RQS with those parameters
+        logJ += sum of per-element log-det
+      If RQS_coupling_block(target=(1,)):
+        Same but x-coords condition, y-coords get transformed
+
+  Step 4: remove_origin.F_network2data(x)
+    Prepends zero vector for particle 0
+    Shape: (B, 62) -> (B, 64)
+    logJ += 0
+
+  Step 5: normalize_box_sys.F_network2data(x)
+    x = x * box_length / 2   --> maps from [-1, 1] back to [-L/2, L/2]
+    logJ += sum(log(box_length/2))
+    Shape: (B, 64) -> (B, 64)
+
+  Output: x of shape (B, 64), in physical coordinates
+
+4c. Conditioner network (parameter_equivariant_network):
+
+  Input: identity coordinates, shape (B, 31, in_dim)
+    - For target=(0,): in_dim=1 (y-coordinates only)
+    - For target=(1,): in_dim=1 (x-coordinates only)
+
+  Step 1: Sinusoidal positional encoding
+    n_freqs = 8
+    For each input coordinate c in [-1, 1]:
+      cos_enc = cos(k * pi * c) for k = 1, 2, ..., 8
+      sin_enc = sin(k * pi * c) for k = 1, 2, ..., 8
+    Output: (B, 31, 16) -- 8 cos + 8 sin features per particle
+
+    NOTE: This encoding is designed for PERIODIC inputs in [-1, 1].
+    cos(k*pi*c) and sin(k*pi*c) are periodic with period 2, matching
+    the normalized box. This is NOT the standard Transformer positional
+    encoding -- it encodes the VALUE of coordinates, not the position
+    in a sequence.
+
+  Step 2: Linear projection
+    (B, 31, 16) -> (B, 31, 128)
+    Linear layer with weight shape (16, 128)
+
+  Step 3: TransformerEncoder
+    - 1 layer (depth=1)
+    - d_model = 128
+    - nhead = 128/64 = 2 attention heads
+    - dim_feedforward = 128*4 = 512
+    - batch_first = True
+    - norm_first = True (pre-norm architecture)
+    - dropout = 0.0
+    (B, 31, 128) -> (B, 31, 128)
+
+  Step 4: Linear projection
+    (B, 31, 128) -> (B, 31, out_dim * 3 * n_bins)
+    For out_dim=1, n_bins=16: output is (B, 31, 48)
+    These 48 values per particle encode:
+      - 16 unnormalized widths
+      - 16 unnormalized heights
+      - 16 unnormalized slopes (+ 1 periodic copy = 17 slopes after cat)
+
+  Output: Per-particle spline parameters for 16-bin RQS
+
+4d. Rational Quadratic Spline (RQS):
+
+  Domain: [-1, 1] -> [-1, 1] (both input and output in normalized coordinates)
+  n_bins = 16
+  min_bin_width = 1e-3
+  min_bin_height = 1e-3
+  min_derivative = 1e-3
+  enable_identity_init = False
+
+  Widths: softmax(unnormalized_widths) scaled to fill [-1, 1]
+    widths = min_bin_width + (1 - min_bin_width*16) * softmax(raw_widths)
+    cumwidths = cumsum(widths), padded with 0, scaled to [-1, 1]
+
+  Heights: same procedure as widths
+
+  Derivatives (slopes): softplus(raw) + min_derivative
+    With enable_identity_init=False: softplus beta = 1 (standard)
+    Slopes are made PERIODIC: slopes = cat([slopes, slopes[..., [0]]])
+    This means derivative at right boundary = derivative at left boundary.
+
+  Forward: standard RQS formula (Durkan et al. 2019)
+    theta = (input - left_edge_of_bin) / bin_width
+    output = f(theta) using rational quadratic interpolation
+    logabsdet = log(derivative_numerator) - 2*log(denominator)
+
+  Inverse: solve quadratic equation for theta
+    logabsdet = -(forward logabsdet)
+
+4e. Circular shift layer:
+
+  Parameters: learnable shift of shape (2,), initialized to zero
+  Forward: x += shift, then PBC wrap in [-1, 1] (box_length=2 in normalized coords)
+  Inverse: x -= shift, then PBC wrap
+  Log-det: 0 (volume preserving)
+
+  There are 16 independent circular_shift layers, each with its own learnable
+  shift parameter. Total: 32 learnable parameters from shifts.
+
+4f. Parameter count:
+
+  Total: 6,612,512 trainable parameters
+  Dominated by the 32 RQS_coupling_blocks, each containing:
+    - parameter_equivariant_network with:
+      - lin_in: 16 * 128 + 128 = 2,176
+      - TransformerEncoderLayer:
+        - self_attn: 4 * 128^2 + 4*128 = 66,048
+        - ff: 128*512 + 512 + 512*128 + 128 = 131,712
+        - 2 LayerNorms: 2 * 2 * 128 = 512
+        Subtotal: ~198,272
+      - lin_out: 128 * 48 + 48 = 6,192
+    Per block: ~206,640
+  32 blocks * ~206,640 = ~6,612,480
+  + 16 circular shifts * 2 = 32
+  Total: ~6,612,512
+
+==========================================================================
+5. WEIGHT INITIALIZATION
+==========================================================================
+
+ALL nn.Linear layers in the flow are initialized with:
+  weight ~ Normal(mean=0, std=0.01)
+  bias   ~ Normal(mean=0, std=0.01)
+
+This is applied via flow_assembler.init_weights() called in __init__:
+  self.apply(self.init_weights)
+
+This means:
+  - The TransformerEncoder's internal Linear layers (Q, K, V projections,
+    feedforward layers) are ALL initialized with std=0.01
+  - The lin_in and lin_out layers are also initialized with std=0.01
+  - This is a VERY SMALL initialization. The spline parameters output by
+    the network will be close to zero, which means:
+    - softmax(near-zero) -> uniform widths/heights
+    - softplus(near-zero) -> ~0.693 derivatives (close to 1)
+    - The flow starts CLOSE TO THE IDENTITY function
+  - The circular_shift parameters start at exactly 0 (no shift initially)
+
+IMPORTANT: This near-identity initialization is deliberate. The flow begins
+as approximately the identity map and gradually deforms as training proceeds.
+If you initialize with larger std, the flow starts as a random nonlinear map
+that could produce configurations with terrible energies, causing huge
+loss values and gradient explosions.
+
+==========================================================================
+6. DYNAMIC PRIOR (LIVE SAMPLING DURING TRAINING)
+==========================================================================
+
+The WCA system is wrapped in a dynamic_prior:
+
+  WCA = dynamic_prior(
+    n_cached = 90000,
+    test_fraction = 0.1,
+    system = WCA,           # the lennard_jones object
+    sampler = MCMC_pr,      # Metropolis MC sampler
+    init_confs = wca_train  # 100,000 initial WCA configurations
+  )
+
+Initialization:
+  1. Split init_confs: 10,000 for test, 90,000 for cache
+  2. Cache stores 90,000 WCA configurations on GPU
+  3. All 90,000 are unique (no repeats needed since 90,000 <= 90,000)
+
+During training (flow.train() mode), when the KLD loss needs source samples:
+  z = self.network.prior.sample(batch_size, beta=beta_source)
+
+  Inside dynamic_prior.sample(N=512, beta=0.5):
+    1. Randomly select 512 indices from the 90,000 cache (WITHOUT replacement)
+    2. Set MCMC sampler's starting configs to those 512 cache entries
+    3. Run MCMC: 1000 production cycles (already equilibrated from init)
+       Each cycle: one random particle displaced by up to 0.2 in each dim
+       After 1000 cycles, configs are somewhat decorrelated from cache entries
+    4. Write the new configs BACK into the cache at those indices
+    5. Return the updated configs
+
+  This means:
+    - The cache is continuously refreshed with new Boltzmann samples
+    - Each training step decorrelates ~512 of the 90,000 cached configs
+    - Over many epochs, the entire cache gets recycled many times
+    - This prevents the KLD loss from overfitting to a fixed set of z samples
+
+During evaluation (flow.eval() mode):
+  - Returns random configs from the 10,000 test set (no MCMC)
+
+KEY DIFFERENCE from using a fixed dataset: The z samples for the KLD loss
+are LIVE -- they change every batch. The x samples for the NLL loss come
+from a fixed dataset (with augmentation). This asymmetry is intentional:
+the target (LJ) data is expensive and fixed, but the source (WCA) data is
+continuously refreshed because it's cheaper and because the KLD loss
+benefits from diverse source samples.
+
+==========================================================================
+7. THE TRAINING LOOP (EXACT PROCEDURE)
+==========================================================================
+
+Hyperparameters:
+  n_epochs = 250
+  batch_size = 512
+  w_xz = 1 (NLL weight)
+  w_zx = 1 (KLD weight)
+  n_dump = 1 (validate every epoch)
+  n_save = 5 (save parameters every 5 epochs)
+
+Steps per epoch: len(train_dataset) // batch_size = 90,000 // 512 = 175
+Total optimization steps: 250 * 175 = 43,750
+
+For each epoch (1 to 250):
+  flow.train()
+
+  For each batch (175 batches per epoch):
+
+    1. SAMPLE x FROM DATASET (NLL direction):
+       x, energy_x = train_dataset[batch_indices]
+       x is a batch of 512 LJ configurations, AUGMENTED:
+         - random particle centered at origin
+         - random octahedral transformation applied
+       energy_x is pre-computed (but NOTE: the pre-computed energy is for the
+       ORIGINAL configuration, not the augmented one. However, the energy is
+       invariant under translation + PBC wrap + rotation/reflection, so this
+       is correct.)
+
+    2. COMPUTE NLL LOSS (x -> z direction):
+       nll, _ = flow.loss_xz(x, beta_source=0.5, beta_target=1.0)
+
+       Inside loss_xz:
+         a. z, logdetJ_xz = flow.F_xz(x)
+            - x (in physical LJ coords) -> normalize -> remove origin
+            - Pass through 48 blocks in REVERSED order with inverse=True
+            - Add origin -> denormalize to WCA coords
+            - Accumulate log-det Jacobian
+
+         b. logp_xz = -beta_source * WCA.energy(z)
+            = -0.5 * U_WCA(z)
+            (unnormalized log-probability of z under WCA Boltzmann dist)
+
+         c. NLL loss = -mean(logp_xz + logdetJ_xz)
+            = -mean(-0.5 * U_WCA(F_inv(x)) + log|det dF_inv/dx|)
+
+            This is the NLL: the negative log-likelihood of x under the
+            model q(x) = p_WCA(F_inv(x)) * |det dF_inv/dx|
+
+            IMPORTANT: The loss does NOT include the term log p_LJ(x).
+            This is because log p_LJ(x) is constant with respect to
+            flow parameters -- it only depends on the data, not the model.
+            So it's dropped from the loss. But it IS included when computing
+            importance weights for RESS during validation.
+
+    3. SAMPLE z FROM DYNAMIC PRIOR (KLD direction):
+       z = flow.prior.sample(512, beta=0.5)
+       This calls dynamic_prior.sample(), which:
+         - Picks 512 configs from cache
+         - Runs 1000 MCMC cycles on them
+         - Updates cache
+         - Returns the decorrelated configs
+
+    4. COMPUTE KLD LOSS (z -> x direction):
+       kld, _ = flow.loss_zx(z, beta_target=1.0, beta_source=0.5)
+
+       Inside loss_zx:
+         a. x, logdetJ_zx = flow.F_zx(z)
+            - z (in WCA coords) -> normalize -> remove origin
+            - Pass through 48 blocks in FORWARD order
+            - Add origin -> denormalize to LJ coords
+            - Accumulate log-det Jacobian
+
+         b. logp_zx = -beta_target * LJ.energy(x)
+            = -1.0 * U_LJ(F(z))
+            (unnormalized log-prob of F(z) under LJ Boltzmann dist)
+
+         c. KLD loss = -mean(logp_zx + logdetJ_zx)
+            = -mean(-U_LJ(F(z)) + log|det dF/dz|)
+
+            Again, the term log p_WCA(z) is constant w.r.t. flow parameters
+            and is dropped.
+
+    5. TOTAL LOSS:
+       loss_total = w_xz * nll + w_zx * kld = 1 * nll + 1 * kld
+
+    6. BACKPROP AND UPDATE:
+       optimizer.zero_grad()
+       loss_total.backward()
+       optimizer.step()
+
+       NOTE: loss.backward() backpropagates through:
+         - The energy computation (U_WCA or U_LJ) -- including the cutin
+           linearization, which makes the energy differentiable at short range
+         - The flow transformations (spline + circular shift)
+         - The conditioner networks (Transformer)
+         - The log-det Jacobian computation
+
+       There is NO gradient clipping applied.
+
+    7. SCHEDULER STEP (per batch, not per epoch!):
+       scheduler.step()
+       The scheduler is MultiStepLR stepping at BATCH-level milestones:
+         milestone_1 = 150 * 175 = 26,250 steps
+         milestone_2 = 225 * 175 = 39,375 steps
+       Default gamma = 0.1, so:
+         Steps 1-26,249:      lr = 1e-4
+         Steps 26,250-39,374: lr = 1e-5
+         Steps 39,375-43,749: lr = 1e-6
+
+       CRITICAL: The milestones are in STEPS, not epochs. The scheduler is
+       called once per batch. With 175 batches/epoch:
+         lr = 1e-4 for epochs 1-150
+         lr = 1e-5 for epochs 151-225
+         lr = 1e-6 for epochs 226-250
+
+  VALIDATION (every epoch, since n_dump=1):
+    flow.eval()
+    with torch.no_grad():
+
+      test_data_x, energy_test_x, test_data_z, energy_test_z = dataset.get_test_data()
+
+      For x -> z direction (NLL):
+        Split 10,000 test configs into batches of 512
+        For each batch:
+          val_nll, val_logw_xz = flow.loss_xz(test_x_batch, 0.5, 1.0, energy_x=energy_batch)
+          val_ress_xz = ress(val_logw_xz)  # RESS per batch
+        Average NLL and RESS across batches
+
+      For z -> x direction (KLD):
+        Split 10,000 test WCA configs into batches of 512
+        For each batch:
+          val_kld, val_logw_zx = flow.loss_zx(test_z_batch, 1.0, 0.5, energy_z=energy_batch)
+          val_ress_zx = ress(val_logw_zx)  # RESS per batch
+        Average KLD and RESS across batches
+
+      NOTE on RESS during validation: RESS is computed PER BATCH (512 samples)
+      and then averaged. This means the reported RESS is an average of
+      ~19 per-batch RESS values, each computed from 512 samples.
+
+      The importance weights during validation include the normalization
+      constants that are dropped during training:
+        logw_xz = logp_xz - logp_x + logdetJ_xz
+                = -0.5*U_WCA(z) - (-1.0*U_LJ(x)) + logdetJ_xz
+        logw_zx = logp_zx - logp_z + logdetJ_zx
+                = -1.0*U_LJ(x) - (-0.5*U_WCA(z)) + logdetJ_zx
+
+  SAVE (every 5 epochs):
+    torch.save(flow.state_dict(), f"flow_parameters_{epoch}.pt")
+    Also saves train_log.txt with columns:
+      epoch, loss_xz, loss_zx, val_loss_xz, ress_xz, val_loss_zx, ress_zx, lr
+
+  Final save: flow_parameters.pt (after all 250 epochs)
+
+==========================================================================
+8. LOSS FUNCTIONS (MATHEMATICAL DERIVATION)
+==========================================================================
+
+Let:
+  p_A(z) = exp(-beta_A * U_A(z)) / Z_A     (WCA Boltzmann distribution)
+  p_B(x) = exp(-beta_B * U_B(x)) / Z_B     (LJ Boltzmann distribution)
+  F: z -> x  (forward flow, source to target)
+  F_inv: x -> z  (inverse flow)
+  J_F = det(dF/dz)
+
+The flow defines two model distributions:
+  q_B(x) = p_A(F_inv(x)) * |J_{F_inv}(x)|
+          = p_A(F_inv(x)) / |J_F(F_inv(x))|
+
+  q_A(z) = p_B(F(z)) * |J_F(z)|
+
+8a. NLL Loss (x -> z, trained on real LJ data x):
+
+  NLL = -E_{x ~ p_B}[log q_B(x)]
+      = -E_{x ~ p_B}[log p_A(F_inv(x)) + log|J_{F_inv}(x)|]
+      = -E_{x ~ p_B}[-beta_A * U_A(F_inv(x)) - log Z_A + log|det dF_inv/dx|]
+
+  Dropping the constant -log Z_A:
+  NLL_train = -E_{x ~ p_B}[-beta_A * U_A(F_inv(x)) + log|det dF_inv/dx|]
+
+  In code: -(logp_xz + logdetJ_xz).mean()
+  where logp_xz = -beta_source * WCA.energy(F_inv(x))
+
+  Minimizing NLL maximizes the likelihood of observing the real LJ data
+  under the model distribution q_B.
+
+  This is equivalent to minimizing KL(p_B || q_B) + const.
+
+8b. KLD Loss (z -> x, trained on sampled WCA data z):
+
+  KLD = E_{z ~ p_A}[log p_A(z) - log q_A(z)]   (this is KL(p_A*F || p_B))
+      = E_{z ~ p_A}[log p_A(z) - log p_B(F(z)) - log|J_F(z)|]
+
+  The term E[log p_A(z)] is constant w.r.t. flow parameters, so:
+  KLD_train = -E_{z ~ p_A}[log p_B(F(z)) + log|J_F(z)|]
+            = -E_{z ~ p_A}[-beta_B * U_B(F(z)) + log|det dF/dz|]   (+ const)
+
+  In code: -(logp_zx + logdetJ_zx).mean()
+  where logp_zx = -beta_target * LJ.energy(F(z))
+
+  Minimizing KLD pushes the flow to map WCA samples onto high-probability
+  regions of the LJ distribution.
+
+8c. Two-sided training:
+
+  loss = w_xz * NLL + w_zx * KLD
+
+  With w_xz = w_zx = 1, both directions are weighted equally.
+
+  WHY two-sided?
+  - NLL alone is "mode-covering" (KL(p||q)) -- tries to cover all of p_B,
+    can spread q too thin, slow to converge density quality
+  - KLD alone is "mode-seeking" (KL(q||p_B)) -- maps source directly to
+    high-probability target regions, but can miss modes of p_B
+  - Combined: balances coverage and density accuracy
+  - In practice, the KLD loss typically dominates early training (because
+    it directly evaluates how good the flow's output looks under the target),
+    while NLL refines the inverse mapping
+
+8d. Importance weights (computed only during evaluation):
+
+  For z -> x: log w_zx = -beta_B * U_B(F(z)) + beta_A * U_A(z) + log|J_F(z)|
+            = log p_B(F(z)) - log p_A(z) + log|J_F(z)| + log(Z_B/Z_A)
+
+  The log(Z_B/Z_A) term is unknown but cancels in normalized weights.
+
+  RESS = 1 / (N * sum(softmax(log_w)^2))
+
+  A perfect flow (F maps p_A exactly to p_B) gives uniform weights and RESS=1.
+  A poor flow gives a few dominant weights and RESS -> 1/N.
+
+==========================================================================
+9. OPTIMIZER AND LEARNING RATE SCHEDULE
+==========================================================================
+
+Optimizer: Adam
+  lr = 1e-4 (initial)
+  betas = (0.9, 0.999) (default)
+  eps = 1e-8 (default)
+  weight_decay = 0 (default)
+  No gradient clipping
+
+Scheduler: MultiStepLR
+  milestones = [150*175, 225*175] = [26250, 39375] (in optimizer steps)
+  gamma = 0.1 (default)
+
+  LR schedule:
+    Epoch 1-150   (step 0-26249):      lr = 1e-4
+    Epoch 151-225 (step 26250-39374):  lr = 1e-5
+    Epoch 226-250 (step 39375-43749):  lr = 1e-6
+
+  IMPORTANT: scheduler.step() is called EVERY BATCH, not every epoch.
+  If you call it per epoch instead, the milestones would fire at epoch 150
+  and 225 with steps_per_epoch=175, but since the milestones are defined as
+  epoch*steps_per_epoch, the behavior is the same only if you step per batch.
+
+  Three-stage training:
+    1. Large LR (1e-4): initial training, loss decreases rapidly
+    2. Medium LR (1e-5): fine-tuning, loss stabilizes
+    3. Small LR (1e-6): final polish, squeezes out last improvements
+
+==========================================================================
+10. COORDINATE SYSTEM AND TRANSFORMATIONS
+==========================================================================
+
+There are THREE coordinate systems in play:
+
+10a. Physical coordinates (data space):
+  - Particle positions in reduced units
+  - Range: [-L/2, L/2] per dimension, where L = box_length = 6.6
+  - Particle 0 is at origin (after centering)
+  - PBC applies: x - L*round(x/L) wraps to [-L/2, L/2]
+
+10b. Normalized coordinates (network space):
+  - Range: [-1, 1] per dimension
+  - Particle 0 is REMOVED (only 31 particles, 62 DOFs)
+  - The flow operates in this space
+  - PBC applies: x - 2*round(x/2) wraps to [-1, 1]
+
+10c. Transformation pipeline (F_zx, source to target):
+
+  z in physical WCA coords [-3.3, 3.3]
+    |
+    v  normalize_box_pr: z *= 2/6.6
+  z in normalized coords [-1, 1], shape (B, 64)
+    |
+    v  remove_origin: strip particle 0
+  z in normalized coords [-1, 1], shape (B, 62)
+    |
+    v  48 flow layers (splines + shifts in [-1, 1])
+  x in normalized coords [-1, 1], shape (B, 62)
+    |
+    v  remove_origin.inverse: prepend zeros for particle 0
+  x in normalized coords [-1, 1], shape (B, 64)
+    |
+    v  normalize_box_sys.inverse: x *= 6.6/2
+  x in physical LJ coords [-3.3, 3.3]
+
+  For F_xz (inverse, target to source):
+    Same pipeline in reverse order, each layer called with inverse=True.
+
+  CRITICAL DETAIL: The normalize_box layers are SEPARATE for prior and
+  posterior sides. Even though box_length is the same (6.6) in this case,
+  the code supports different box lengths. If your source and target have
+  different densities/box sizes, you MUST use the correct normalization
+  on each side.
+
+==========================================================================
+11. ENERGY COMPUTATION AND NUMERICAL SAFEGUARDS
+==========================================================================
+
+11a. LJ energy computation:
+
+  For input x of shape (B, 64):
+    1. Reshape to (B, 32, 2)
+    2. Pairwise differences: rij = pos[:,:,None,:] - pos[:,None,:,:]
+       Shape: (B, 32, 32, 2)
+    3. PBC: rij -= box_length * round(rij / box_length)
+    4. Squared distances: r2 = clamp(sum(rij^2, dim=-1), min=1e-12)
+       Shape: (B, 32, 32, 1)
+    5. r6 = clamp(r2^3, min=1e-12)
+    6. r12 = clamp(r6^2, min=1e-12)
+    7. LJ energy per pair: 4*eps*(sigma^12/r12 - sigma^6/r6) - ecutoff
+    8. Apply cutoff: zero out pairs with r2 >= cutoff^2 or r2 <= tol
+    9. If cutin: for pairs with r < 0.8:
+         e = slope * (r - 0.8) + ecutin
+       where slope = -24*eps/0.8 * (2*(1/0.8)^12 - (1/0.8)^6)
+             ecutin = 4*eps*((1/0.8)^12 - (1/0.8)^6) - ecutoff
+    10. Sum over all pairs: 0.5 * sum(e_part) + N*etail
+
+11b. Numerical safeguards:
+
+  CLAMPING: torch.clamp(r2, min=1e-12) prevents division by zero and
+  prevents NaN gradients from r^(-12). Without this, if two particles
+  overlap exactly, r2=0, r12=0, and 1/r12 = inf.
+
+  LINEARIZATION (cutin=0.8): The LJ potential has a r^(-12) repulsive wall
+  that creates enormous forces at short range. During flow training, the
+  flow might (temporarily) map particles close together. Without cutin:
+    - U(r=0.5) = 4*(1/0.5^12 - 1/0.5^6) = 4*(4096 - 64) = 16128
+    - grad_r U(r=0.5) is even larger
+  With cutin=0.8, the energy is replaced by a linear function below r=0.8:
+    - The slope at r=0.8 is finite and moderate
+    - The energy doesn't explode, so gradients remain manageable
+    - This means the loss landscape is smoother near particle overlaps
+
+  WHY THIS MATTERS FOR TRAINING: If the flow produces configurations where
+  particles overlap (which happens early in training when the flow is near-
+  identity and maps WCA configs to LJ coords without proper adjustment),
+  the LJ energy can be extremely large. This causes:
+    1. Very negative logp_zx = -beta * huge_energy
+    2. Very large KLD loss
+    3. Huge gradients
+    4. Optimizer overshoot -> worse configs -> training diverges
+
+  The cutin linearization caps the gradient contribution from close pairs,
+  stabilizing early training.
+
+==========================================================================
+12. THINGS THAT CAN SILENTLY BREAK YOUR TRAINING
+==========================================================================
+
+12a. DATA AUGMENTATION OMITTED OR WRONG
+  If you're not doing the random-particle centering + octahedral transforms,
+  the flow only learns to handle configurations centered on one particle.
+  During generation, MCMC samples will be centered on different particles,
+  and the flow won't generalize. Symptoms: loss decreases on training data
+  but RESS stays low/zero, generated configurations look wrong.
+
+  The octahedral_transformation generates a random rotation/reflection
+  matrix. In 2D, the symmetry group has 8 elements:
+    {identity, 90deg, 180deg, 270deg} x {no reflection, reflection}
+  The code generates this by:
+    1. Random permutation of axes (2! = 2 options)
+    2. Random sign flip per axis (2^2 = 4 options)
+  Total: 8 elements, matching the octahedral group in 2D.
+
+12b. CUTIN NOT SET OR TOO SMALL
+  Without cutin, or with cutin too small (e.g., 0.1), the LJ energy gradient
+  at short range is enormous. Early in training, the flow is near-identity,
+  and WCA configs mapped through it will have some close approaches that
+  produce huge LJ energies. This can cause:
+    - NaN in energy computation
+    - Gradient explosion
+    - Training that appears to progress but never achieves good RESS
+
+12c. WEIGHT INITIALIZATION TOO LARGE
+  With std=0.01, the flow starts near-identity. If you use PyTorch default
+  initialization (which for Linear layers uses Kaiming/Xavier with much
+  larger std), the flow starts as a random nonlinear map. This maps
+  Boltzmann-distributed configs to garbage, producing huge energies and
+  loss values from step 1.
+
+  The code explicitly overrides ALL Linear layer initialization:
+    module.weight.data.normal_(mean=0.0, std=0.01)
+    module.bias.data.normal_(mean=0.0, std=0.01)
+
+  This is applied recursively to the ENTIRE flow_assembler (via self.apply),
+  including the TransformerEncoder's internal layers.
+
+12d. SCHEDULER MILESTONES IN WRONG UNITS
+  Milestones are in OPTIMIZER STEPS, not epochs. If you define milestones
+  as [150, 225] thinking they're epochs, the LR would drop after just 150
+  optimizer steps (less than 1 epoch), causing training to stall immediately.
+
+  The correct milestones: [150*steps_per_epoch, 225*steps_per_epoch]
+
+12e. DYNAMIC PRIOR NOT REFRESHED
+  If you use a fixed set of source samples for the KLD loss (instead of
+  the dynamic_prior with MCMC), the flow can overfit to those specific
+  samples. The KLD loss will look good on training data but the flow won't
+  generalize to new source samples. Symptoms: low KLD loss but low RESS.
+
+12f. NORMALIZATION LAYERS MISMATCHED
+  The prior-sided and posterior-sided normalization layers must use the
+  correct box lengths. If you accidentally use the same box_length for
+  both (and they differ), the flow operates in a distorted coordinate
+  system. In this codebase both are 6.6, so it doesn't matter, but if
+  you adapt this to different densities it will.
+
+12g. PARTICLE 0 NOT REMOVED
+  The flow operates on 31 particles (62 DOFs), not 32. Particle 0 is at
+  the origin by construction (centering). If you feed 32 particles into
+  the flow, particle 0's coordinates are redundant zeros that the flow
+  might try to transform, wasting capacity and potentially causing issues.
+
+12h. PBC NOT APPLIED IN CIRCULAR SHIFT
+  The circular_shift layer wraps coordinates with round(x/2)*2 (in
+  normalized coords). If you skip this wrapping, shifted coordinates can
+  go outside [-1, 1], and the RQS will throw "Input Outside Domain".
+
+12i. SPLINE PERIODICITY NOT ENFORCED
+  slopes = cat([slopes, slopes[..., [0]]], dim=-1)
+  This makes the spline derivative continuous at the boundary of [-1, 1].
+  Without this, the spline has a discontinuity in its derivative at the
+  boundary, which is inconsistent with PBC. The flow would produce
+  different Jacobians for configurations that differ only by a PBC wrap.
+
+12j. TEST DATA FOR PRIOR NOT FROM SAME DISTRIBUTION
+  In PBCDataset, the test z data comes from:
+    self.test_data_z = flow.prior.sample(n_test, beta=beta_source)
+  During training, flow.prior is in training mode, so this draws from the
+  CACHE. But during dataset construction, it's called in eval mode, so it
+  draws from the TEST partition of the cache. Make sure your test z data
+  is properly Boltzmann-distributed.
+
+12k. ENERGY LABELS REUSED AFTER AUGMENTATION
+  The energy label passed to __getitem__ is the energy of the ORIGINAL
+  configuration. After augmentation (random centering + octahedral transform),
+  the configuration is different. This works ONLY because the energy is
+  invariant under:
+    1. Translation (centering on a different particle)
+    2. PBC wrapping
+    3. Rotation/reflection (octahedral group)
+  If your system's energy is NOT invariant under these operations (e.g.,
+  external field, non-periodic boundaries), using pre-computed energy labels
+  with augmentation will produce wrong gradients.
+
+12l. TRAINING BOTH DIRECTIONS WITH UNEQUAL SAMPLE SIZES
+  The NLL uses 512 LJ configs from the fixed dataset.
+  The KLD uses 512 WCA configs from the dynamic prior.
+  If one side has many more effective samples (e.g., more MCMC decorrelation),
+  it can dominate training. The w_xz=w_zx=1 weighting assumes both
+  directions contribute equally. Imbalanced sample quality -> biased training.
+
+==========================================================================
+13. DIAGNOSTIC CHECKLIST
+==========================================================================
+
+If your training isn't working, check these in order:
+
+[ ] 1. Does the loss decrease at all in the first few epochs?
+       If not: initialization is probably wrong (too large std),
+       or energies are NaN (missing cutin).
+
+[ ] 2. Plot the LJ energy of F(z) for a batch of WCA samples.
+       At epoch 0 (near-identity flow): the energy should be finite
+       (not inf or NaN). If it is, your cutin is missing or broken.
+
+[ ] 3. Is RESS > 0 from epoch 1?
+       Identity RESS (no flow) should be nonzero. In this codebase:
+         id RESS zx ~ 0.017 (WCA->LJ direction)
+         id RESS xz ~ 0.002 (LJ->WCA direction)
+       If your identity RESS is effectively 0, the source and target
+       distributions are too far apart for direct importance sampling.
+       The flow needs to work harder, and training may be much slower.
+
+[ ] 4. Are both loss components (NLL and KLD) decreasing?
+       If only one decreases, the other direction's samples may be bad.
+       Common cause: augmentation issues (NLL side) or dynamic prior
+       not refreshing (KLD side).
+
+[ ] 5. Does RESS increase over training?
+       Typical progression in this codebase:
+         Epoch 1: RESS_zx ~ 0.02, RESS_xz ~ 0.002
+         Epoch 50: RESS_zx ~ 0.03, RESS_xz ~ 0.003
+         Epoch 150: RESS_zx ~ 0.03-0.05, RESS_xz ~ 0.005
+         Final: RESS_zx ~ 0.02-0.05 (after LR drops)
+       If RESS isn't increasing, the flow isn't learning the mapping.
+
+[ ] 6. Is the LR schedule correct?
+       Check scheduler.get_last_lr() at different epochs.
+       Should be 1e-4 initially, drop to 1e-5 at epoch 150, 1e-6 at 225.
+
+[ ] 7. Are the generated configurations physically reasonable?
+       After training, generate some configs and visualize particle
+       positions. They should look like a liquid (distributed throughout
+       the box), not a crystal or gas.
+
+[ ] 8. Inspect the log-weights distribution.
+       Plot histogram of log_w_zx for a batch. Should be roughly Gaussian.
+       If it has extreme outliers (values < -1000), some configurations
+       have terrible energies. This points to cutin issues or the flow
+       producing unphysical configurations.
+
+[ ] 9. Check for NaN propagation.
+       Add torch.isnan(loss).any() checks. NaN can start in energy
+       computation and propagate through everything. Common sources:
+       - r2 = 0 (particle overlap without clamping)
+       - log(negative number) in RQS logabsdet
+       - exp(huge number) in Metropolis acceptance
+
+[ ] 10. Verify coordinate ranges.
+        After normalize_box, all coordinates should be in [-1, 1].
+        After flow transformation, they should still be in [-1, 1]
+        (the RQS maps [-1,1] to [-1,1] and circular shifts wrap with PBC).
+        If coordinates escape this range, the RQS will crash.
+
+==========================================================================
+APPENDIX A: EXACT NUMBERS FROM THIS TRAINING RUN
+==========================================================================
+
+System:
+  WCA: rho=0.7346, T=2, box=6.6x6.6, cutoff=1.1225, cutin=0.8
+  LJ:  rho=0.7346, T=1, box=6.6x6.6, cutoff=2.5, cutin=0.8
+
+Training data: 100,000 configs each (90k train, 10k test)
+
+Flow: 48 layers, 6.6M parameters, 16-bin RQS, depth-1 Transformer, dim=128
+
+Training: 250 epochs, batch=512, 175 steps/epoch = 43,750 total steps
+  LR: 1e-4 (ep 1-150), 1e-5 (ep 151-225), 1e-6 (ep 226-250)
+  Loss: NLL + KLD (equal weight)
+  Optimizer: Adam (default betas, no weight decay, no grad clip)
+
+Post-training evaluation (on 10,000 sample configs):
+  RESS zx (WCA->LJ): ~0.020 (flow improves over identity's 0.017)
+  RESS xz (LJ->WCA): ~0.0016 (flow slightly below identity's 0.002)
+
+  NOTE: The x->z RESS being WORSE than identity suggests the inverse
+  direction is harder to train. The z->x direction is the primary one
+  that matters for generating LJ samples from WCA input.
+
+==========================================================================
+APPENDIX B: WHAT THE TWO LOSS DIRECTIONS ACTUALLY DO
+==========================================================================
+
+Think of it this way:
+
+NLL (x -> z): "Given a real LJ configuration, how likely is it that my
+flow produced it?" This trains the INVERSE flow. It ensures that if you
+take a real target sample and push it backwards through the flow, you land
+on a high-probability region of the source distribution.
+
+KLD (z -> x): "Given a WCA configuration, does my flow produce something
+that looks like a real LJ configuration?" This trains the FORWARD flow.
+It ensures that if you take a source sample and push it forward, the result
+has low energy under the target Hamiltonian.
+
+Both are needed because:
+- NLL alone can learn an inverse that's great but whose forward produces
+  spread-out, low-quality samples (mode-covering)
+- KLD alone can learn a forward that maps to one good region but misses
+  other modes of the target (mode-seeking)
+- Together, they find a flow that's good in both directions
+
+==========================================================================
+APPENDIX C: THE ROLE OF EACH COMPONENT IN TRAINING SUCCESS
+==========================================================================
+
+MUST-HAVE (training won't work without these):
+  [x] Small weight initialization (std=0.01)
+  [x] Energy linearization (cutin=0.8)
+  [x] PBC-aware circular shifts
+  [x] Periodic spline slopes
+  [x] Correct coordinate normalization ([-L/2,L/2] <-> [-1,1])
+  [x] Particle 0 removal
+  [x] Two-sided loss
+
+IMPORTANT (significantly affects quality):
+  [x] Data augmentation (random centering + octahedral transforms)
+  [x] Dynamic prior with MCMC refresh
+  [x] LR schedule with 2 drops
+  [x] Sufficient model capacity (8 blocks, 16 bins, dim=128)
+
+NICE-TO-HAVE (modest improvements):
+  [x] Pre-computed energy labels (avoids redundant computation)
+  [x] Large training set (100,000 configs)
+  [x] Multiple replicas for evaluation

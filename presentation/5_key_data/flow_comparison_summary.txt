@@ -1,0 +1,8 @@
+Flow MCMC Comparison  T*=0.36  rho*=0.3  N=128
+Local moves: 500000  Flow proposals per chain: 505
+Flow acceptance rate (gas-init): 0.000
+Flow acceptance rate (liq-init): 0.000
+
+Gas-init mixing time (U/N within 0.10 of liq_mean):
+  Without flow: 0/8 mixed  NONE
+  With flow:    0/8 mixed  NONE

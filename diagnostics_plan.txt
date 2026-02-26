@@ -1,0 +1,145 @@
+================================================================================
+DIAGNOSTICS PLAN: Coexistence Metastability Characterisation
+================================================================================
+
+Goal: Establish quantitative ground truth for the LJ gas-liquid phase boundary
+at (N=128, ρ*=0.30) before training the normalising flow.  The five diagnostics
+below build sequentially; each produces a figure worth showing to supervisors.
+
+Run order:
+    python scripts/diag1_long_convergence.py          # ~15 min
+    python scripts/diag2_equilibrium_grid.py          # <1 min (reads diag1)
+    python scripts/diag3_op_histogram.py              # <1 min (reads diag1)
+    python scripts/diag4_temp_panel.py                # ~30 min
+    python scripts/diag5_mixing_time.py               # <1 min (reads diag1+4)
+
+All outputs go to experiments/diag{N}/.
+
+================================================================================
+DIAGNOSTIC 1 — Convergence test: do gas-init chains ever coalesce?
+================================================================================
+
+Script:   scripts/diag1_long_convergence.py
+Input:    none (generates from scratch)
+Output:   experiments/diag1/T{T}_data.npz
+          experiments/diag1/T{T}_timeseries.png   ← U/N vs moves, liq vs gas
+          experiments/diag1/T{T}_filmstrip.png    ← snapshots every 50K moves
+
+Conditions:
+    N=128, ρ*=0.30, T*=0.36 and T*=0.45
+    4 liquid-init chains + 4 gas-init chains per temperature
+    500 000 total moves, sampled every 5 000 (100 checkpoints)
+    Snapshot saved every 50 000 moves (10 frames per chain)
+
+Key question for supervisors:
+  At T*=0.36: do the gas-init chains (blue) eventually reach the same U/N as
+  the liquid-init chains (red dashed), and if so, after how many moves?
+  If they converge, the convergence time is the mixing time — the number the
+  flow must beat.  At T*=0.45, convergence should be faster, confirming we are
+  near or above T_c.
+
+Saved arrays in each NPZ:
+    sample_times      (n_samples,)          — move count at each checkpoint
+    energies_liq      (n_chains, n_samples) — U/N
+    energies_gas      (n_chains, n_samples) — U/N
+    op_liq            (n_chains, n_samples) — largest cluster fraction
+    op_gas            (n_chains, n_samples) — largest cluster fraction
+    snapshots_liq     (n_chains, n_snaps, N*D)
+    snapshots_gas     (n_chains, n_snaps, N*D)
+    configs_final_liq (n_chains, N*D)
+    configs_final_gas (n_chains, N*D)
+    metadata          T_star, rho, N, D, L, r_cut
+
+================================================================================
+DIAGNOSTIC 2 — Equilibrium snapshot grid
+================================================================================
+
+Script:   scripts/diag2_equilibrium_grid.py
+Input:    experiments/diag1/T{T}_data.npz
+Output:   experiments/diag2/T{T}_grid.png
+
+Layout: 2 rows × 4 columns.
+    Row 1 (crimson):  4 liquid-init final configurations
+    Row 2 (steel):    4 gas-init final configurations
+
+If both inits have fully converged to the same phase, the two rows should look
+identical — all showing one big droplet + dilute surroundings.  Remaining
+visual difference is the genuine kinetic barrier at that temperature.
+
+Run once per temperature:
+    python scripts/diag2_equilibrium_grid.py --temperature 0.36
+    python scripts/diag2_equilibrium_grid.py --temperature 0.45
+
+================================================================================
+DIAGNOSTIC 3 — Order parameter histogram from equilibrated chains
+================================================================================
+
+Script:   scripts/diag3_op_histogram.py
+Input:    experiments/diag1/T{T}_data.npz
+Output:   experiments/diag3/T{T}_histograms.png
+
+Uses the last 200 000 moves (last 40 checkpoints) as the "production" window.
+Plots side-by-side histograms of U/N and largest_cluster_fraction, overlaying
+liquid-init (crimson) and gas-init (steel blue).
+
+Interpretation:
+  - Unimodal overlapping histograms → fully equilibrated, single metastable state
+  - Separated distributions → genuine phase trapping
+  - Bimodal within one init type → rare spontaneous transitions observed
+
+================================================================================
+DIAGNOSTIC 4 — Temperature panel with full equilibration
+================================================================================
+
+Script:   scripts/diag4_temp_panel.py
+Input:    none (generates from scratch; can optionally read diag1 warm starts)
+Output:   experiments/diag4/T{T}_data.npz   (time series per temperature)
+          experiments/diag4/scatter_grid.png  ← polished version of visual_coex_check
+
+Temperatures: [0.33, 0.36, 0.39, 0.42, 0.45, 0.50], ρ*=0.30
+4 liquid-init + 4 gas-init chains, 500K equil moves (in 5K chunks), then
+snapshot final configs.
+
+This is the main figure for a presentation: left half = liquid-cluster init
+stays dense/clustered, right half = dispersed gas-init, same temperature.
+Remaining differences at T*=0.50 indicate whether T_c > 0.50 or just kinetic
+trapping above T_c.
+
+Also saves time series NPZ (same format as diag1) for use by Diagnostic 5.
+
+================================================================================
+DIAGNOSTIC 5 — Mixing time vs temperature
+================================================================================
+
+Script:   scripts/diag5_mixing_time.py
+Input:    experiments/diag1/T*_data.npz   (T=0.36, 0.45)
+          experiments/diag4/T*_data.npz   (all 6 temperatures)
+Output:   experiments/diag5/mixing_time.png
+
+Definition of mixing time for chain c at temperature T:
+    First checkpoint k such that U_gas(c, k) >= mean(U_liq) - THRESHOLD
+    where THRESHOLD = 0.10 (U/N units, default).  If never reached, τ = ∞.
+
+Plot: τ (in units of 1000 moves) vs T*, one scatter point per gas-init chain
+plus a solid line for the median.  Expected shape: τ diverges as T drops below
+T_c (growing barrier), collapses above T_c (fast mixing).
+
+This is the quantitative motivation for the flow:
+    "At T*=0.36, single-particle MCMC needs X moves to mix.
+     We aim to reduce this to Y using normalising flow proposals."
+
+================================================================================
+PARAMETERS (shared defaults, override via CLI)
+================================================================================
+
+    N         = 128          particle count
+    D         = 2            dimensions
+    RHO       = 0.30         number density (fixed across all diagnostics)
+    N_CHAINS  = 4            chains per init type
+    CHUNK     = 5_000        moves per recording interval
+    N_TOTAL   = 500_000      total moves (diag1, diag4)
+    SNAP_EVERY= 50_000       moves between filmstrip snapshots
+    R_CUT     = 1.6733       cluster OP cutoff (σ), from Stage A g(r) analysis
+    LJ_CUTOFF = 2.5          LJ potential cutoff (σ) — do NOT confuse with R_CUT
+
+================================================================================

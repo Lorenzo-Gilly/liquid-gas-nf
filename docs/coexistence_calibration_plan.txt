@@ -1,0 +1,611 @@
+================================================================================
+RIGOROUS PLAN: DETERMINING GAS-LIQUID METASTABILITY FOR 2D LJ NF PIPELINE
+================================================================================
+
+DATE: 2026-02-25
+SYSTEM: 2D LJ, cutoff=2.5σ, shifted to zero at cutoff, use_lrc=False [A1]
+LITERATURE T*_c: ~0.44-0.46 (Smit & Frenkel 1991, trunc+shifted)
+
+────────────────────────────────────────────────────────────────────────────────
+PART 0: ROOT CAUSE ANALYSIS OF ALL PREVIOUS FAILURES
+────────────────────────────────────────────────────────────────────────────────
+
+All runs to date have failed to find robust coexistence (max OP_gap = 0.289).
+The failures have THREE distinct root causes, each independent.
+
+ROOT CAUSE 1: OP IS USELESS AS A DISCRIMINATOR AT ρ*≈0.35
+
+The cluster OP = largest_cluster_fraction uses r_cut≈1.67σ as the connectivity
+threshold. At density ρ*, the mean inter-particle spacing is s = ρ*^{-1/2}.
+
+  s(ρ*=0.35) = 1.69σ ≈ r_cut = 1.67σ
+
+A UNIFORM distribution (gas-like, no structure) at ρ*=0.35 has ALL particles
+within r_cut of each other across the full box. The cluster OP of a uniform
+gas at ρ*=0.35 is ≈1.0 — IDENTICAL to a compact liquid cluster.
+
+Consequence: at ρ*=0.35, the dispersed gas init CANNOT produce OP < 0.5, even
+if no LJ interactions existed. The OP_gap threshold of 0.4 is physically
+impossible to achieve at this density. The entire Stage B/C sweep at ρ*=0.35
+was measuring nothing physically meaningful.
+
+ROOT CAUSE 2: WRONG DENSITY RANGE — LEVER RULE LIMITS MAXIMUM OP_GAP
+
+Even at densities where OP is discriminating (ρ*≈0.30), the lever rule caps
+the maximum achievable liquid-cluster OP:
+
+  f_liq = (ρ* - ρ_gas) / (ρ_liq - ρ_gas)
+
+At T*=0.36: ρ_liq≈0.60, ρ_gas≈0.04:
+  f_liq(ρ*=0.30) = (0.30 - 0.04) / (0.60 - 0.04) ≈ 0.46
+  → max OP_liq ≈ 0.46, impossible to reach OP_liq > 0.6
+
+  f_liq(ρ*=0.35) = (0.35 - 0.04) / (0.60 - 0.04) ≈ 0.55
+  → max OP_liq ≈ 0.55, still below OP_gap=0.4 threshold
+
+Both ρ* choices guarantee the OP_gap threshold is NEVER satisfied, regardless
+of metastability. The spec thresholds are calibrated for separate-phase boxes,
+not mixed-phase boxes. (Liquid-init systems in current runs STAY at OP≈1.0
+because a compact cluster at local density >0.60 resists evaporation — this is
+a kinetic effect that hides the lever-rule ceiling for short runs.)
+
+ROOT CAUSE 3: STAGE C SWEEPS THE WRONG DIRECTION
+
+The Stage C anchor logic: "if best Stage B T* < 0.38, anchor on T_c=0.44 and
+sweep T*=0.39–0.50." This is backward. The coexistence signal INCREASES with
+decreasing T* (further below T_c = deeper subcritical = wider two-phase region
+= longer nucleation times). Stage C should sweep LOWER temperatures (0.28–0.38)
+not higher ones (0.39–0.50). All Stage C data is near or above T_c and thus
+poorly resolved.
+
+Summary:
+  - Stage B at ρ*=0.35: OP completely blind (ROOT CAUSE 1)
+  - Stage B/C at ρ*=0.30: OP ceiling at 0.46 (ROOT CAUSE 2)
+  - Stage C at T*=0.39–0.50: wrong direction (ROOT CAUSE 3)
+  - NONE of these runs have told us anything definitive about metastability.
+
+────────────────────────────────────────────────────────────────────────────────
+PART 1: PHYSICS FRAMEWORK
+────────────────────────────────────────────────────────────────────────────────
+
+WHAT METASTABILITY MEANS IN THIS CONTEXT
+-----------------------------------------
+"Metastability" for NF training means:
+
+  LIQUID METASTABILITY: A system initialized as liquid (compact cluster)
+  retains OP > 0.5 throughout a production run of duration τ_sim.
+  No spontaneous evaporation or breakup occurs within τ_sim.
+
+  GAS METASTABILITY: A system initialized as dispersed gas retains
+  OP < 0.2 throughout τ_sim. No spontaneous nucleation of a dominant
+  liquid cluster occurs within τ_sim.
+
+This is a KINETIC requirement, not thermodynamic. Both states can be
+thermodynamically metastable (not the global free-energy minimum) as long as
+the kinetic barrier is large relative to kT.
+
+NUCLEATION TIME AND THE BARRIER
+---------------------------------
+Classical 2D nucleation theory gives:
+
+  τ_nucl ~ exp(π γ² / (k_B T |Δμ|))
+
+where:
+  γ    = line tension of the liquid-gas interface (units: energy/length)
+  Δμ   = chemical potential difference from coexistence (the "supersaturation")
+
+For gas → liquid nucleation starting from a dispersed gas:
+  Δμ = μ_gas(ρ*, T) - μ_coex_gas(T) > 0 drives nucleation
+
+  |Δμ| is SMALL when ρ* is close to ρ_gas_coex(T)
+  |Δμ| is LARGE when ρ* >> ρ_gas_coex(T) (highly supersaturated)
+
+  → Lower density = less supersaturation = LONGER nucleation time ✓
+  → Closer to coexistence density = more metastable gas ✓
+
+The kinetic prefactor also decreases at lower T (slower diffusion), which
+further extends τ_nucl at lower temperatures.
+
+KEY DENSITY CONSTRAINT
+-----------------------
+For the cluster OP to discriminate gas from liquid, we need:
+
+  s_mean = ρ*^{-1/2} >> r_cut = 1.67σ
+
+  → ρ* << r_cut^{-2} = 0.36
+
+Gas-like OP (OP < 0.2) is achievable only when ρ* < 0.20 (s_mean > 2.24σ).
+This is NOT compatible with a single box at ρ*=0.35.
+
+COEXISTENCE DENSITIES (literature estimates for our potential)
+--------------------------------------------------------------
+2D LJ, cutoff=2.5σ, shift=True:
+
+  T*     ρ*_liq (est.)  ρ*_gas (est.)  Source
+  0.30   0.64–0.67      0.015–0.025    Smit & Frenkel 1991
+  0.33   0.62–0.65      0.020–0.035    interpolated
+  0.36   0.59–0.63      0.030–0.050    Smit & Frenkel 1991
+  0.39   0.56–0.60      0.045–0.070    interpolated
+  T*_c   —              —              ≈0.44–0.46
+
+Note: at ρ*=0.35 (the "critical" density), neither phase dominates cleanly.
+The equilibrium state at T*<T_c is a two-phase mixture, NOT a pure phase.
+
+NVT ARCHITECTURE CONSTRAINT: SINGLE FIXED L THROUGHOUT
+--------------------------------------------------------
+The normalizing flow is hardcoded to a single box size L in three places:
+
+  (1) The Rescale bijector is initialized as Rescale(-L/2, L/2, -1, 1).
+      Configs from a different L' get rescaled by the wrong factor and land
+      outside [-1,1], breaking the flow's normalisation assumption entirely.
+
+  (2) Energy functions are JIT-compiled with L baked in via functools.partial.
+      A config physically spanning L'=56σ evaluated with L=14σ has all its
+      PBC-wrapped distances wrong — pairs that are actually 30σ apart appear
+      as ~2σ, producing garbage energies.
+
+  (3) The DynamicPrior MCMC refreshes are compiled with a fixed box_length.
+      There is no per-sample or per-batch L.
+
+CONSEQUENCE: every config in base dataset, target dataset, and the running
+MCMC chain must come from the SAME box size L_sim = sqrt(N / ρ*_sim).
+Mixing configs from two boxes at different ρ* (different L) is not possible
+without rewriting the flow architecture to NPT (include L as a degree of
+freedom in the config vector — a significant change not currently planned).
+
+TWO-BOX APPROACH IS VALID FOR CALIBRATION ONLY
+-----------------------------------------------
+The pure-phase pressure runs in Stage 1 use different L values (different ρ*)
+and are purely standalone NVT MCMC — no flow is involved. They find T_coex.
+
+For NF TRAINING DATA: all configs must use L_sim.
+  - Liquid target configs: long liquid-init chains at (L_sim, T_coex).
+    The compact cluster is kinetically stable; collect freely.
+  - Gas target configs: many SHORT gas-init chains at (L_sim, T_coex), each
+    run for K moves where K << τ_nucl. Collect pre-nucleation samples only.
+    Stage 2 measures τ_nucl at L_sim to set K.
+
+For FLOW-AUGMENTED MCMC COMPARISON: same L_sim.
+  - Liquid-init chains: compact cluster at OP≈f_liq, kinetically stable ✓
+  - Gas-init chains: dispersed at OP≈1/N, must stay gas for τ_sim moves
+  The comparison requires τ_nucl >> τ_sim at (L_sim, T_coex).
+  This is measured empirically in Stage 2.
+
+COEXISTENCE CONDITION (how to measure it)
+------------------------------------------
+True coexistence requires equal pressure and chemical potential in both phases:
+  P_liq(T, ρ_liq) = P_gas(T, ρ_gas)
+  μ_liq(T, ρ_liq) = μ_gas(T, ρ_gas)
+
+The virial pressure in 2D NVT (reduced units, ε=σ=k_B=1):
+  P = ρ* T* + (1/2A) × <Σ_{i>j} [48/r_ij^12 - 24/r_ij^6]>   (pairs with r < 2.5σ)
+
+This is implementable in JAX. Chemical potential requires Widom insertion (more
+expensive). For our purposes, pressure equality is the primary test.
+
+────────────────────────────────────────────────────────────────────────────────
+PART 2: THE PLAN
+────────────────────────────────────────────────────────────────────────────────
+
+OVERVIEW
+--------
+Stage 0: Add virial pressure to the codebase (small function, ~10 lines).
+Stage 1: Two-box pure-phase pressure calibration → find T_coex, ρ_liq, ρ_gas.
+         [CALIBRATION ONLY — different L per box, no NF involved]
+Stage 2: Single-box nucleation time measurement at L_sim → find τ_nucl(ρ*_sim).
+         [Determines viable ρ*_sim and the pre-nucleation window K for data gen]
+Stage 3: Confirm observables at (L_sim, T_coex) — g(r), energy, OP histograms.
+Stage 4: Data generation — all configs at L_sim using pre-nucleation gas sampling.
+(T_base selection and gallery from original Stage D/E proceed once Stage 4 is done.)
+
+
+────────────────────────────────
+STAGE 0: IMPLEMENT VIRIAL PRESSURE
+────────────────────────────────
+
+Add to physics.py or diagnostics.py:
+
+  def virial_pressure(configs, N, D, L, T_star):
+      """
+      Virial pressure for 2D LJ batch, reduced units.
+      P = rho*T* + (1/2A) * <W>
+      where W = Σ_{i>j within r_cut} [48/r^12 - 24/r^6]  (r in units of σ)
+
+      Args:
+        configs: (B, N*D) configurations
+        N, D, L: system parameters
+        T_star:  reduced temperature
+
+      Returns:
+        (B,) pressures, one per config
+      """
+
+The sum is over all INTERACTING pairs (r < 2.5σ). This reuses the pair distance
+machinery already in lj_energy. Implement as pure JAX, JIT-compilable.
+
+Verification test: At T*=0.42, ρ*=0.35, compare measured <P> to the
+ideal-gas pressure ρ*T*=0.147. The virial correction should be negative
+(attractions dominate at moderate density), giving P < ρ*T*.
+
+
+────────────────────────────────
+STAGE 1: TWO-BOX PURE-PHASE PRESSURE CALIBRATION
+────────────────────────────────
+
+Goal: Find T_coex and the coexistence densities ρ_liq(T_coex), ρ_gas(T_coex).
+
+Protocol:
+
+1a. LIQUID BRANCH — run N=128 at ρ*=0.55, 0.60, 0.65 for T*=0.28, 0.30,
+    0.33, 0.36, 0.39. Use liquid init. 50K equil + 100K production.
+    Record: mean_OP (verify > 0.95), virial_pressure, mean_energy.
+    NO HOT EQUILIBRATION — start cold from triangular lattice.
+
+1b. GAS BRANCH — run N=128 at ρ*=0.03, 0.05, 0.08 for same T* grid.
+    Use gas init (any spacing > r_cut works at these densities since
+    spacing≥3.5σ >> r_cut=1.67σ).
+    100K equil + 100K production. Record: mean_OP (verify < 0.05 after
+    at most 30K moves — if OP rises, nucleation occurred, discard).
+    Record: virial_pressure.
+
+1c. COEXISTENCE CONDITION: find (T*, ρ_liq*, ρ_gas*) such that:
+      P_liq(T*, ρ_liq*) = P_gas(T*, ρ_gas*)
+    Procedure:
+      - Plot P vs ρ* isotherms for both phases.
+      - For each T*, find ρ_liq and ρ_gas on the isotherm where pressures
+        are equal (interpolating between the three liquid densities and
+        three gas densities tested).
+      - Cross-check with expected values from literature.
+
+1d. SANITY CHECKS:
+    - Liquid-phase P must INCREASE with ρ* at constant T* (mechanically stable).
+    - Gas-phase P must increase with ρ* (ideal gas limit: P→ρ*T*).
+    - At T*>T_c≈0.44, there should be no pressure discontinuity between dense
+      and dilute branches (single-phase fluid).
+
+Expected result: T_coex ≈ 0.33–0.38, ρ_liq ≈ 0.58–0.63, ρ_gas ≈ 0.03–0.06.
+
+N=128 is sufficient for this stage. The pressure converges well in NVT.
+
+
+────────────────────────────────
+STAGE 2: SINGLE-BOX NUCLEATION TIME MEASUREMENT
+────────────────────────────────
+
+Goal: Find (T*, ρ*_single) in the two-phase region where τ_nucl > 500K moves.
+This is the operating point for the flow-augmented MCMC comparison.
+
+Protocol:
+
+2a. DENSITY SCAN: Test ρ*_single = 0.10, 0.15, 0.20, 0.25, 0.30 at T*=T_coex.
+    For each: run 8 gas-init chains (dispersed, OP≈1/N at start) for 500K moves.
+    Save OP every 1000 moves (500 samples/chain). Record:
+      - t_nucl: first time OP exceeds 0.30 (nucleation event)
+      - frac_nucleated: fraction of chains that nucleated within 500K moves
+
+    Target: frac_nucleated < 0.25 (i.e., ≥6/8 chains survive 500K moves as gas).
+
+2b. LIQUID EVAPORATION CHECK: At same (T*, ρ*_single), run 8 liquid-init chains
+    for 500K moves. Verify OP > 0.5 throughout (no evaporation). If the
+    compact liquid cluster at this density has OP < 0.3 (lever rule too small),
+    try higher ρ*.
+
+2c. OP GAP CHECK: The true OP_gap = OP_liq_surviving - OP_gas_surviving,
+    measured ONLY from chains that have NOT yet transitioned.
+    This is different from the mean OP (which mixes pre- and post-nucleation).
+
+EXPECTED OUTCOME: At ρ*_single ≈ 0.10-0.15 and T*=T_coex:
+  - Gas chains: spacing ≈ 3–5σ >> r_cut, essentially isolated particles,
+    OP≈1/N≈0.008 for ~100-500K moves before nucleation.
+  - Liquid chains: compact cluster with OP ≈ f_liq = (ρ*-ρ_gas)/(ρ_liq-ρ_gas)
+    ≈ 0.08-0.20 (modest, but STABLE and nonzero).
+
+Note: At ρ*≈0.10-0.15, f_liq is small (0.10-0.20). The resulting OP_gap is
+modest (~0.1-0.2) but CLEAN and REPRODUCIBLE. This is better than the noisy
+gap of 0.289 from the current run.
+
+For ρ*_single = 0.25-0.30 (closer to critical):
+  - f_liq ≈ 0.36-0.46 (more liquid in box) → bigger OP_liq
+  - But gas chains at these densities nucleate faster
+  - Must measure empirically whether τ_nucl is sufficient
+
+
+────────────────────────────────
+STAGE 3: CONFIRMATION AND PARAMETER SELECTION
+────────────────────────────────
+
+3a. From Stage 1: T_coex, ρ_liq_coex, ρ_gas_coex confirmed via pressure equality.
+3b. From Stage 2: ρ*_sim confirmed via τ_nucl > 500K moves at L_sim=sqrt(N/ρ*_sim).
+    Also extract pre-nucleation window K: largest K such that <5% of gas chains
+    have OP > 0.20 before K moves. K will be used in Stage 4.
+3c. T_base = T_coex + 0.15 to T_coex + 0.30 (from existing Stage D logic).
+3d. L_sim = sqrt(N / ρ*_sim). ALL training data and MCMC comparison use this L.
+
+Confirm virial pressure at L_sim:
+  P(ρ_liq_coex, T_coex) ≈ P(ρ_gas_coex, T_coex)    (within ~10% is acceptable)
+  P measured in standalone calibration runs (Stage 1), NOT in the L_sim box.
+
+────────────────────────────────
+STAGE 4: DATA GENERATION AT L_sim
+────────────────────────────────
+
+Goal: produce 500K liquid-like configs and 500K gas-like configs, ALL at L_sim.
+
+CONSTRAINT: L_sim, N, and T_coex are fixed from Stage 3. Every config in both
+datasets must be generated in a box of exactly this L_sim. Mixing configs from
+any other box size is architecturally invalid (see NVT ARCHITECTURE CONSTRAINT).
+
+4a. LIQUID TARGET CONFIGS (500K):
+    - 16 liquid-init chains at (L_sim, T_coex).
+    - Per chain: 5K hot equil (0.8β) + 50K cold equil (β) + production.
+    - Production: run indefinitely, saving every 200 moves. Collect until
+      500K total samples across all chains.
+    - Post-filter: discard any config with OP < 0.30 (rare evaporation events).
+    - Verify: mean OP > f_liq - 0.05, energy histogram unimodal.
+
+4b. GAS TARGET CONFIGS (500K):
+    The core problem: at L_sim (ρ*_sim ≈ 0.15–0.25), gas-init chains nucleate
+    after τ_nucl moves. We need 500K pre-nucleation samples.
+
+    PROTOCOL — PARALLEL SHORT RUNS:
+    - Launch B chains simultaneously (B sized to fill GPU memory; B=64–256).
+    - Each chain: dispersed init (_make_gas_init_dispersed), 0 equil, run for
+      K moves (K from Stage 3b, conservatively set to 0.5 × median τ_nucl).
+    - Save configs at every 200 moves → floor(K/200) samples per chain.
+    - Discard any chain where OP ever exceeds 0.20 before K moves (early
+      nucleation). Keep only clean pre-nucleation trajectories.
+    - Repeat until 500K gas samples collected.
+      Required chains = ceil(500K / floor(K/200) / (1 - early_nucl_rate)).
+      Example: K=20K, early_nucl_rate=0.10 → 100 samples/chain →
+               ceil(500K / 100 / 0.90) ≈ 5600 chains. At B=256 per batch,
+               ~22 batches.
+
+    ALTERNATIVE PROTOCOL if K is large (τ_nucl >> 20K):
+    - Run fewer, longer chains (K = 0.5 × τ_nucl), save more samples per chain.
+    - Same early-nucleation discard rule applies.
+
+    VERIFY: OP histogram of gas configs has peak at OP ≈ 1/N (isolated particles).
+            Energy histogram peaks at E/N ≈ 0 to -0.5 (near-ideal gas).
+
+4c. COMBINE AND VERIFY:
+    - Concatenate and shuffle liquid (500K) + gas (500K) → 1M target configs.
+    - Compute energy histogram: must be bimodal with Ashman D > 2.
+      E_liq/N peak ≈ -2.5 to -3.5; E_gas/N peak ≈ -0.1 to -0.5.
+    - Compute OP histogram: should show two peaks, though the gas peak will be
+      at OP ≈ f_liq (liquid cluster) and OP ≈ 0 (gas). The separation depends
+      on ρ*_sim; energy is the more reliable discriminator.
+    - 10 snapshot plots from each phase: visually confirm liquid cluster vs
+      dispersed gas.
+
+4d. BASE DATASET (unchanged from original spec):
+    - N=N, L=L_sim, T=T_base. Liquid init, full equilibration.
+    - Verify unimodal OP and energy (single fluid phase).
+    - The base distribution must use the SAME L_sim as the target.
+
+NOTES ON K SELECTION:
+    K must satisfy two competing requirements:
+    (i)  K >> τ_equil_gas: the gas-init needs a few sweeps to relax any lattice
+         artifacts (typically 500–2000 moves).
+    (ii) K << τ_nucl: the gas must not have nucleated by move K.
+    The safe choice is K = min(τ_nucl × 0.3, 50K moves). If Stage 2 finds
+    τ_nucl < 5K moves at all tested ρ*_sim, the gas phase is not achievable
+    at this density — reduce ρ*_sim or T* (see Failure 4).
+
+
+────────────────────────────────────────────────────────────────────────────────
+PART 3: FAILURE MODES AND MITIGATIONS
+────────────────────────────────────────────────────────────────────────────────
+
+FAILURE 1: Gas box nucleates immediately even at ρ*=0.03-0.08
+-------------------------------------------------------------
+Symptom: Stage 1b shows OP rising from ≈0 to ≈1 within 10K moves at all
+         gas-branch densities.
+Cause:   T* is below the spinodal gas density. At T*=0.30 and ρ*=0.08, the
+         gas may be inside the spinodal (thermodynamically unstable, not just
+         metastable) — nucleation is barrierless.
+Mitigation:
+  - Use higher T* (0.36 instead of 0.30). The gas is more stable at higher T.
+  - Use lower ρ* (0.03 instead of 0.08). Less supersaturated.
+  - Measure OP time series carefully: the first 5-10K moves should show OP≈1/N.
+    Any nucleation before 10K moves at ρ*=0.03 means T* is too low.
+  - If problem persists at all (T*, ρ*_gas) pairs tested, use Widom insertion
+    to find the spinodal more precisely and target ρ* just above it.
+
+FAILURE 2: Pressure equality not achievable (P_liq >> P_gas at all T*)
+----------------------------------------------------------------------
+Symptom: At the densities tested, the two branches never intersect in P vs T*.
+Cause:   Wrong density range tested. Liquid at ρ*=0.60 may be overpressurized
+         relative to gas at ρ*=0.05. Need to find the right densities first.
+Mitigation:
+  - Run both phases at the SAME total pressure by using the following iterative
+    scheme:
+      (i)   Start: ρ_liq=0.60, ρ_gas=0.05, T*=0.36.
+      (ii)  Measure P_liq and P_gas.
+      (iii) If P_liq > P_gas: try lower ρ_liq (e.g., 0.55) or higher ρ_gas (e.g., 0.07).
+      (iv)  Iterate until |P_liq - P_gas| / P < 0.05.
+  - Alternatively: use the equation of state from literature (Smit & Frenkel 1991
+    Table I) to initialize at the correct coexistence densities.
+
+FAILURE 3: Liquid cluster evaporates at low ρ*_single
+---------------------------------------------------
+Symptom: Stage 2b shows OP drops below 0.3 for liquid-init chains at ρ*=0.10.
+Cause:   At low ρ*, the equilibrium liquid cluster is small (f_liq≈0.10) and
+         thermally unstable. The "liquid" phase disappears.
+Mitigation:
+  - Use higher ρ*_single (0.20-0.25 instead of 0.10).
+  - Lower T* to increase liquid stability (lower T → smaller ρ_gas → f_liq bigger).
+  - Accept a modest OP_liq (0.20-0.30) and verify it's still bimodal from gas.
+
+FAILURE 4: Gas chains nucleate too fast at ρ*_single=0.25-0.30
+-------------------------------------------------------------
+Symptom: Stage 2a shows >6/8 chains nucleate within 500K moves at ρ*>0.20.
+Cause:   At ρ*=0.25 and T*=0.36, the gas supersaturation is high and τ_nucl
+         is shorter than needed.
+Mitigation:
+  - Lower T* to 0.30-0.33 (slower kinetics despite higher thermodynamic driving).
+    Empirically, kinetic slowdown at low T dominates over thermodynamic driving.
+  - Use N=256 (larger system: bigger critical nucleus required → longer τ_nucl).
+  - Accept ρ*_single=0.10-0.15 (smaller OP_liq but guaranteed gas metastability).
+  - For the NF comparison: it is ACCEPTABLE if τ_nucl ≈ 100K moves (not 500K),
+    as long as τ_nucl >> τ_local_MCMC_sweep (=128 moves). The comparison only
+    needs plain MCMC to be stuck and flow-MCMC to cross.
+
+FAILURE 5: OP_gap at ρ*_single=0.10-0.15 is too small for flow to learn
+-----------------------------------------------------------------------
+Symptom: OP_liq≈0.15, OP_gas≈0.01, gap≈0.14. Flow training fails to produce
+         clearly distinct gas/liquid configs.
+Cause:   At low ρ*, the liquid cluster is small and the OP gap is modest. The
+         flow may not have a clear signal to learn.
+Mitigation:
+  - Use ρ*_single=0.20-0.25 (compromise: larger OP_liq at cost of shorter τ_nucl).
+  - Use ENERGY per particle instead of OP as the primary order parameter:
+    E_liq/N ≈ -3.0 to -4.0 (dense, many interactions)
+    E_gas/N ≈ -0.1 to -0.5 (dilute, few interactions)
+    Energy gap is much larger than OP gap and doesn't depend on r_cut.
+  - Use radial distribution function peak height g(r_peak) as order parameter
+    (liquid: sharp peak ≈4-6; gas: flat g(r)≈1).
+
+FAILURE 6: Pressure calculation inaccurate due to rare close approaches
+----------------------------------------------------------------------
+Symptom: Virial pressure has huge variance, mean is unreliable.
+Cause:   Close particle pairs (r~σ) contribute large r^{-12} terms to virial.
+Mitigation:
+  - Discard first 1% of production samples (warm-up outliers).
+  - Use long runs (100K+ production) so variance → mean converges.
+  - Check: at gas-phase densities, P should approach ideal gas limit ρ*T*.
+    Use this as a diagnostic: if measured P deviates from ρ*T* by >20% at
+    ρ*=0.03, T*=0.40 (far from coexistence, should be near-ideal), the
+    pressure estimator has a bug.
+
+FAILURE 7: N=128 shows size-dependent coexistence (finite-size effects)
+-----------------------------------------------------------------------
+Symptom: Measured T_coex varies between N=64, 128, 256. Nucleation in small
+         systems even at "metastable" densities.
+Cause:   In 2D, finite-size effects are especially strong near T_c. N=128 may
+         still be too small for a clear first-order transition signal.
+Mitigation:
+  - Run Stage 1 at BOTH N=128 and N=256 to check convergence.
+  - If T_coex shifts by >0.02 between N=128 and 256, use N=256 for all stages.
+  - Rule of thumb: need L >> ξ (correlation length). At T=0.8T_c, ξ≈5σ,
+    so L=19σ is marginal. At T=0.7T_c≈0.31, ξ≈3σ, so N=128 should be ok.
+
+FAILURE 8: No τ_nucl long enough for the MCMC comparison at any ρ*_sim
+----------------------------------------------------------------------
+Symptom: Stage 2 finds τ_nucl < τ_sim at all tested ρ*_sim values. Even at
+         the lowest viable density, gas chains nucleate before the comparison
+         run finishes, making plain MCMC appear ergodic.
+Cause:   The 2D LJ nucleation barrier is too small at this N and T_coex.
+         The two-phase region is too narrow (close to T_c).
+Mitigation:
+  - Lower T* to 0.28–0.30 (kinetics slow dramatically below 0.7×T_c).
+  - Increase N to 256 (larger critical nucleus required → exponentially longer
+    τ_nucl). L_sim changes accordingly (L=sqrt(256/ρ*_sim)).
+  - Decouple DATA GENERATION from the MCMC COMPARISON:
+      Data generation uses K << τ_nucl (pre-nucleation gas samples), which works
+      even if τ_nucl is only 10K moves — just run more parallel chains.
+      The MCMC comparison additionally requires τ_nucl >> τ_sim (longer runs).
+      If only data generation is feasible, do that first, then revisit N for
+      the comparison separately.
+  - Note: the NVT architecture constraint still applies. Switching to two boxes
+    of different L is not a valid mitigation without implementing NPT. The
+    short-run pre-nucleation approach is the correct fallback within NVT.
+
+FAILURE 9: Stage C anchor logic in calibrate_coex.py sweeps wrong direction
+--------------------------------------------------------------------------
+Symptom: (Already observed.) Stage C anchors at T_c=0.44 when best B T*<0.38.
+Cause:   Wrong heuristic. Coexistence signal is STRONGEST at low T*, not near T_c.
+Mitigation:
+  - Fix Stage C: always sweep from (T_coex_estimate - 0.08) to (T_coex_estimate)
+    in steps of 0.01. Use T_coex_estimate from Stage 1 (pressure calibration).
+  - Remove the "< 0.38 anchor" logic entirely.
+
+────────────────────────────────────────────────────────────────────────────────
+PART 4: OBSERVABLES AND SUCCESS CRITERIA (REVISED)
+────────────────────────────────────────────────────────────────────────────────
+
+Replace the single OP_gap threshold with THREE independent criteria:
+
+CRITERION 1 — PRESSURE EQUALITY (Stage 1 output)
+  |P_liq(T_coex, ρ_liq) - P_gas(T_coex, ρ_gas)| / P_gas < 0.10
+  This verifies thermodynamic coexistence, independent of metastability.
+
+CRITERION 2 — GAS PHASE SURVIVAL (Stage 2 output)
+  At ρ*_single, T_coex: fraction of gas-init chains with OP<0.20 after 500K
+  moves ≥ 0.75 (i.e., 6/8 chains survive as gas).
+  This verifies kinetic metastability for the MCMC comparison.
+
+CRITERION 3 — ENERGY BIMODALITY (replaces OP_gap as primary discriminator)
+  In combined liquid + gas config set (both at L_sim):
+  Energy histogram must be bimodal with Ashman D > 2.
+  E/N for liquid ≈ -2.5 to -3.5; E/N for gas ≈ -0.1 to -0.5.
+  Energy is computed by lj_energy (already implemented).
+  This is robust to the density ambiguities that confound OP.
+
+CRITERION 4 — OP SEPARATION (secondary, single-box data)
+  In the collected liquid and gas config sets (both at L_sim):
+  mean OP of liquid configs > f_liq - 0.05
+    where f_liq = (ρ*_sim - ρ_gas_coex) / (ρ_liq_coex - ρ_gas_coex)
+  mean OP of gas configs (pre-nucleation) < 0.05
+  These are measured separately, not as a gap in a combined distribution.
+
+Note: the lever-rule ceiling means OP_gap in a single L_sim box will be
+f_liq (typically 0.15–0.45), not 0.80+. Energy bimodality (Criterion 3) is
+the definitive check. OP separation is a useful secondary diagnostic.
+
+────────────────────────────────────────────────────────────────────────────────
+PART 5: IMPLEMENTATION CHECKLIST
+────────────────────────────────────────────────────────────────────────────────
+
+□ [NEW CODE] Implement virial_pressure(configs, N, D, L, T_star) in diagnostics.py
+    Formula: P = rho*T* + (1/2A)*<Σ_{i>j<r_cut} [48/r^12 - 24/r^6]>
+    Test: at low ρ* (0.03) and high T* (0.50), verify P ≈ ρ*T* (ideal gas).
+
+□ [NEW SCRIPT] calibrate_coex_v2.py — implementing Stages 0-3 above
+    Use existing run_mcmc, lj_energy, make_liquid_init, make_gas_init from
+    physics.py and diagnostics.py. Do NOT modify those files.
+    Key parameters:
+      N=128 (or 256 if needed)
+      Liquid box: ρ*=0.55, 0.60, 0.65 at T*=0.28, 0.30, 0.33, 0.36, 0.39
+      Gas box:    ρ*=0.03, 0.05, 0.08 at same T* grid
+      Single box: ρ*=0.10, 0.15, 0.20, 0.25, 0.30 at T_coex (from Stage 1)
+
+□ [VERIFICATION] Cross-check virial P vs literature values for 2D LJ.
+    Smit & Frenkel 1991, Table I gives P vs ρ* isotherms. Match to within 10%.
+
+□ [ANALYSIS] Plot P_liq(ρ*) and P_gas(ρ*) on same axes for each T*.
+    The crossing point gives (ρ_liq_coex, ρ_gas_coex) at each T*.
+
+□ [ANALYSIS] Nucleation time plot: τ_nucl vs ρ*_single at T_coex.
+    Log-scale y-axis. Identify the density below which τ_nucl > 500K moves.
+
+□ [DATA GEN] Generate training data — ALL configs at L_sim = sqrt(N/ρ*_sim).
+    Liquid (500K): 16 liquid-init chains, 5K hot + 50K cold equil + production.
+                   Save every 200 moves. Post-filter OP < 0.30. Verify OP > f_liq-0.05.
+    Gas (500K):    parallel short runs of K moves each (K from Stage 3b).
+                   Discard any chain that nucleates (OP > 0.20) before K moves.
+                   Required ≈ 500K / floor(K/200) / (1-early_nucl_rate) total chains.
+                   Verify OP ≈ 1/N and E/N ≈ 0 to -0.5.
+    Combine and verify: bimodal energy histogram, Ashman D > 2. Snapshot gallery.
+
+────────────────────────────────────────────────────────────────────────────────
+PART 6: WHAT TO DO WITH THE CURRENT OVERNIGHT RUN
+────────────────────────────────────────────────────────────────────────────────
+
+The current run (N128_v3_overnight) will select T_coex≈0.39 (max Ashman D=2.69
+so far) and proceed to Stages D and E. This is not wasted work:
+
+  USABLE: Stage A r_cut=1.6733σ (valid for the cluster OP)
+  USABLE: Stage C shows D>2 throughout T*=0.39-0.48, confirming some bimodality
+           signal exists near T_c (informative for T_base selection)
+  USABLE: Stage D will confirm T_base ≈ 0.49-0.59 (above T_c, single-phase fluid)
+  NOT USABLE: T_coex=0.39 from the current run is unreliable — it comes from
+              a Stage C anchored at T_c, not from pressure-based coexistence.
+              The actual T_coex (from pressure equilibration) will likely be 0.33-0.37.
+
+Recommended: let the current run finish (Stage D and E will complete quickly
+since they run at T_base >> T_c). Use the Stage E gallery as a diagnostic.
+Then run calibrate_coex_v2.py with the new protocol.
+
+================================================================================
+END OF PLAN
+================================================================================

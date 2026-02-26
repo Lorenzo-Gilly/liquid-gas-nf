@@ -10,6 +10,7 @@ Public API:
     largest_cluster_fraction(coords, N, D, L, r_cut)
     mean_coordination(coords, N, D, L, r_cut)
     potential_energy_per_particle(configs, energy_fn, N)
+    virial_pressure(configs, N, D, L, T_star, lj_cutoff=2.5)
     snapshot_plot(coords, N, D, L, r_cut=None, title="", save_path=None, ax=None)
     multi_panel_diagnostic(configs_batch, N, D, L, r_cut, energy_fn, title, save_path)
     make_liquid_init(N, D, L, rng_key=None, energy_fn=None)
@@ -255,6 +256,62 @@ def potential_energy_per_particle(configs, energy_fn, N):
     if configs.ndim == 1:
         configs = configs[None]
     return _np(energy_fn(configs)) / N
+
+
+# ---------------------------------------------------------------------------
+# Virial pressure
+# ---------------------------------------------------------------------------
+
+def virial_pressure(configs, N, D, L, T_star, lj_cutoff=2.5):
+    """Virial pressure for a batch of LJ configurations (NVT, reduced units).
+
+    Formula (2D, ε=σ=k_B=1):
+        P = ρ* T* + (1/2A) × <Σ_{i>j, r<r_cut} [48/r^12 − 24/r^6]>
+
+    The shift applied to the LJ potential is a constant and does not affect
+    the forces, so the virial is identical for the shifted and unshifted cases.
+
+    Args:
+        configs:    (B, N*D) or (N*D,) configurations (numpy or JAX).
+        N, D, L:    system parameters.
+        T_star:     reduced temperature (k_B=1, so T* = k_B T / ε = T / ε).
+        lj_cutoff:  LJ interaction cutoff in σ units (default 2.5).
+
+    Returns:
+        pressures: (B,) numpy array, one virial pressure per config.
+        mean_P:    float, mean pressure over the batch.
+
+    Verification:
+        At low density (ρ*=0.03) and high temperature (T*=0.50), the virial
+        correction is small and P should approach the ideal-gas limit ρ*T*.
+        If |P/(ρ*T*) - 1| > 0.20 under those conditions, suspect a bug.
+    """
+    configs = _np(configs)
+    scalar = (configs.ndim == 1)
+    if scalar:
+        configs = configs[None]
+    B = configs.shape[0]
+
+    rho  = N / (L ** D)
+    area = L ** D  # L^2 in 2D
+
+    # All pairwise distances: (B, n_pairs)
+    dists = _pbc_dist_batch(configs, N, D, L)
+
+    # Mask pairs outside the LJ cutoff; replace masked r with 1.0 to avoid
+    # divide-by-zero (the contribution is zeroed out by the mask anyway).
+    within = dists < lj_cutoff
+    r_safe = np.where(within, dists, 1.0)
+
+    r6   = r_safe ** 6
+    r12  = r6 * r6
+
+    # Virial sum per pair: 48/r^12 - 24/r^6 (zero outside cutoff)
+    w_pair = np.where(within, 48.0 / r12 - 24.0 / r6, 0.0)
+    W = w_pair.sum(axis=1)  # (B,)
+
+    pressures = rho * T_star + W / (2.0 * area)
+    return pressures, float(pressures.mean())
 
 
 # ---------------------------------------------------------------------------

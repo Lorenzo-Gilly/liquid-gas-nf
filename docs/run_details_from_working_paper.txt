@@ -1,0 +1,407 @@
+Run ID: NVT_N032_WCA2LJ_rho_0.73_T2_to_rho_0.73_T1_main
+Training started on: 2026-02-06 16:19:32.918328
+Training finished on: 2026-02-08 09:03:25.363734
+
+z: wca -> x: lennard-jones
+Tz: 2 -> Tx: 1
+
+source training data: ./data/N032/wca/rho_0.73_T_2_train.pt
+target training data: ./data/N032/lennard-jones/rho_0.73_T_1_train.pt
+source sample data: ./data/N032/wca/rho_0.73_T_2_sample.pt
+target sample data: ./data/N032/lennard-jones/rho_0.73_T_1_sample.pt
+
+elements in source training data: 100000
+elements in target training data: 100000
+elements in source sample data: 100000
+elements in target sample data: 100000
+
+batch size: 512
+Training x->z: w_xz = 1
+Training z->x: w_zx = 1
+
+Flow architecture:
+flow_assembler(
+  (prior): dynamic_prior(
+    (system): lennard_jones()
+  )
+  (posterior): lennard_jones()
+  (prior_sided_transformation_layers): ModuleList(
+    (0): normalize_box()
+    (1): remove_origin()
+  )
+  (posterior_sided_transformation_layers): ModuleList(
+    (0): normalize_box()
+    (1): remove_origin()
+  )
+  (blocks): ModuleList(
+    (0): circular_shift()
+    (1-2): 2 x RQS_coupling_block(
+      (network): parameter_equivariant_network(
+        (lin_in): Linear(in_features=16, out_features=128, bias=True)
+        (transformer_encoder): TransformerEncoder(
+          (layers): ModuleList(
+            (0): TransformerEncoderLayer(
+              (self_attn): MultiheadAttention(
+                (out_proj): NonDynamicallyQuantizableLinear(in_features=128, out_features=128, bias=True)
+              )
+              (linear1): Linear(in_features=128, out_features=512, bias=True)
+              (dropout): Dropout(p=0.0, inplace=False)
+              (linear2): Linear(in_features=512, out_features=128, bias=True)
+              (norm1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (norm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (dropout1): Dropout(p=0.0, inplace=False)
+              (dropout2): Dropout(p=0.0, inplace=False)
+            )
+          )
+        )
+        (lin_out): Linear(in_features=128, out_features=48, bias=True)
+      )
+    )
+    (3): circular_shift()
+    (4-5): 2 x RQS_coupling_block(
+      (network): parameter_equivariant_network(
+        (lin_in): Linear(in_features=16, out_features=128, bias=True)
+        (transformer_encoder): TransformerEncoder(
+          (layers): ModuleList(
+            (0): TransformerEncoderLayer(
+              (self_attn): MultiheadAttention(
+                (out_proj): NonDynamicallyQuantizableLinear(in_features=128, out_features=128, bias=True)
+              )
+              (linear1): Linear(in_features=128, out_features=512, bias=True)
+              (dropout): Dropout(p=0.0, inplace=False)
+              (linear2): Linear(in_features=512, out_features=128, bias=True)
+              (norm1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (norm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (dropout1): Dropout(p=0.0, inplace=False)
+              (dropout2): Dropout(p=0.0, inplace=False)
+            )
+          )
+        )
+        (lin_out): Linear(in_features=128, out_features=48, bias=True)
+      )
+    )
+    (6): circular_shift()
+    (7-8): 2 x RQS_coupling_block(
+      (network): parameter_equivariant_network(
+        (lin_in): Linear(in_features=16, out_features=128, bias=True)
+        (transformer_encoder): TransformerEncoder(
+          (layers): ModuleList(
+            (0): TransformerEncoderLayer(
+              (self_attn): MultiheadAttention(
+                (out_proj): NonDynamicallyQuantizableLinear(in_features=128, out_features=128, bias=True)
+              )
+              (linear1): Linear(in_features=128, out_features=512, bias=True)
+              (dropout): Dropout(p=0.0, inplace=False)
+              (linear2): Linear(in_features=512, out_features=128, bias=True)
+              (norm1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (norm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (dropout1): Dropout(p=0.0, inplace=False)
+              (dropout2): Dropout(p=0.0, inplace=False)
+            )
+          )
+        )
+        (lin_out): Linear(in_features=128, out_features=48, bias=True)
+      )
+    )
+    (9): circular_shift()
+    (10-11): 2 x RQS_coupling_block(
+      (network): parameter_equivariant_network(
+        (lin_in): Linear(in_features=16, out_features=128, bias=True)
+        (transformer_encoder): TransformerEncoder(
+          (layers): ModuleList(
+            (0): TransformerEncoderLayer(
+              (self_attn): MultiheadAttention(
+                (out_proj): NonDynamicallyQuantizableLinear(in_features=128, out_features=128, bias=True)
+              )
+              (linear1): Linear(in_features=128, out_features=512, bias=True)
+              (dropout): Dropout(p=0.0, inplace=False)
+              (linear2): Linear(in_features=512, out_features=128, bias=True)
+              (norm1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (norm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (dropout1): Dropout(p=0.0, inplace=False)
+              (dropout2): Dropout(p=0.0, inplace=False)
+            )
+          )
+        )
+        (lin_out): Linear(in_features=128, out_features=48, bias=True)
+      )
+    )
+    (12): circular_shift()
+    (13-14): 2 x RQS_coupling_block(
+      (network): parameter_equivariant_network(
+        (lin_in): Linear(in_features=16, out_features=128, bias=True)
+        (transformer_encoder): TransformerEncoder(
+          (layers): ModuleList(
+            (0): TransformerEncoderLayer(
+              (self_attn): MultiheadAttention(
+                (out_proj): NonDynamicallyQuantizableLinear(in_features=128, out_features=128, bias=True)
+              )
+              (linear1): Linear(in_features=128, out_features=512, bias=True)
+              (dropout): Dropout(p=0.0, inplace=False)
+              (linear2): Linear(in_features=512, out_features=128, bias=True)
+              (norm1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (norm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (dropout1): Dropout(p=0.0, inplace=False)
+              (dropout2): Dropout(p=0.0, inplace=False)
+            )
+          )
+        )
+        (lin_out): Linear(in_features=128, out_features=48, bias=True)
+      )
+    )
+    (15): circular_shift()
+    (16-17): 2 x RQS_coupling_block(
+      (network): parameter_equivariant_network(
+        (lin_in): Linear(in_features=16, out_features=128, bias=True)
+        (transformer_encoder): TransformerEncoder(
+          (layers): ModuleList(
+            (0): TransformerEncoderLayer(
+              (self_attn): MultiheadAttention(
+                (out_proj): NonDynamicallyQuantizableLinear(in_features=128, out_features=128, bias=True)
+              )
+              (linear1): Linear(in_features=128, out_features=512, bias=True)
+              (dropout): Dropout(p=0.0, inplace=False)
+              (linear2): Linear(in_features=512, out_features=128, bias=True)
+              (norm1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (norm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (dropout1): Dropout(p=0.0, inplace=False)
+              (dropout2): Dropout(p=0.0, inplace=False)
+            )
+          )
+        )
+        (lin_out): Linear(in_features=128, out_features=48, bias=True)
+      )
+    )
+    (18): circular_shift()
+    (19-20): 2 x RQS_coupling_block(
+      (network): parameter_equivariant_network(
+        (lin_in): Linear(in_features=16, out_features=128, bias=True)
+        (transformer_encoder): TransformerEncoder(
+          (layers): ModuleList(
+            (0): TransformerEncoderLayer(
+              (self_attn): MultiheadAttention(
+                (out_proj): NonDynamicallyQuantizableLinear(in_features=128, out_features=128, bias=True)
+              )
+              (linear1): Linear(in_features=128, out_features=512, bias=True)
+              (dropout): Dropout(p=0.0, inplace=False)
+              (linear2): Linear(in_features=512, out_features=128, bias=True)
+              (norm1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (norm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (dropout1): Dropout(p=0.0, inplace=False)
+              (dropout2): Dropout(p=0.0, inplace=False)
+            )
+          )
+        )
+        (lin_out): Linear(in_features=128, out_features=48, bias=True)
+      )
+    )
+    (21): circular_shift()
+    (22-23): 2 x RQS_coupling_block(
+      (network): parameter_equivariant_network(
+        (lin_in): Linear(in_features=16, out_features=128, bias=True)
+        (transformer_encoder): TransformerEncoder(
+          (layers): ModuleList(
+            (0): TransformerEncoderLayer(
+              (self_attn): MultiheadAttention(
+                (out_proj): NonDynamicallyQuantizableLinear(in_features=128, out_features=128, bias=True)
+              )
+              (linear1): Linear(in_features=128, out_features=512, bias=True)
+              (dropout): Dropout(p=0.0, inplace=False)
+              (linear2): Linear(in_features=512, out_features=128, bias=True)
+              (norm1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (norm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (dropout1): Dropout(p=0.0, inplace=False)
+              (dropout2): Dropout(p=0.0, inplace=False)
+            )
+          )
+        )
+        (lin_out): Linear(in_features=128, out_features=48, bias=True)
+      )
+    )
+    (24): circular_shift()
+    (25-26): 2 x RQS_coupling_block(
+      (network): parameter_equivariant_network(
+        (lin_in): Linear(in_features=16, out_features=128, bias=True)
+        (transformer_encoder): TransformerEncoder(
+          (layers): ModuleList(
+            (0): TransformerEncoderLayer(
+              (self_attn): MultiheadAttention(
+                (out_proj): NonDynamicallyQuantizableLinear(in_features=128, out_features=128, bias=True)
+              )
+              (linear1): Linear(in_features=128, out_features=512, bias=True)
+              (dropout): Dropout(p=0.0, inplace=False)
+              (linear2): Linear(in_features=512, out_features=128, bias=True)
+              (norm1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (norm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (dropout1): Dropout(p=0.0, inplace=False)
+              (dropout2): Dropout(p=0.0, inplace=False)
+            )
+          )
+        )
+        (lin_out): Linear(in_features=128, out_features=48, bias=True)
+      )
+    )
+    (27): circular_shift()
+    (28-29): 2 x RQS_coupling_block(
+      (network): parameter_equivariant_network(
+        (lin_in): Linear(in_features=16, out_features=128, bias=True)
+        (transformer_encoder): TransformerEncoder(
+          (layers): ModuleList(
+            (0): TransformerEncoderLayer(
+              (self_attn): MultiheadAttention(
+                (out_proj): NonDynamicallyQuantizableLinear(in_features=128, out_features=128, bias=True)
+              )
+              (linear1): Linear(in_features=128, out_features=512, bias=True)
+              (dropout): Dropout(p=0.0, inplace=False)
+              (linear2): Linear(in_features=512, out_features=128, bias=True)
+              (norm1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (norm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (dropout1): Dropout(p=0.0, inplace=False)
+              (dropout2): Dropout(p=0.0, inplace=False)
+            )
+          )
+        )
+        (lin_out): Linear(in_features=128, out_features=48, bias=True)
+      )
+    )
+    (30): circular_shift()
+    (31-32): 2 x RQS_coupling_block(
+      (network): parameter_equivariant_network(
+        (lin_in): Linear(in_features=16, out_features=128, bias=True)
+        (transformer_encoder): TransformerEncoder(
+          (layers): ModuleList(
+            (0): TransformerEncoderLayer(
+              (self_attn): MultiheadAttention(
+                (out_proj): NonDynamicallyQuantizableLinear(in_features=128, out_features=128, bias=True)
+              )
+              (linear1): Linear(in_features=128, out_features=512, bias=True)
+              (dropout): Dropout(p=0.0, inplace=False)
+              (linear2): Linear(in_features=512, out_features=128, bias=True)
+              (norm1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (norm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (dropout1): Dropout(p=0.0, inplace=False)
+              (dropout2): Dropout(p=0.0, inplace=False)
+            )
+          )
+        )
+        (lin_out): Linear(in_features=128, out_features=48, bias=True)
+      )
+    )
+    (33): circular_shift()
+    (34-35): 2 x RQS_coupling_block(
+      (network): parameter_equivariant_network(
+        (lin_in): Linear(in_features=16, out_features=128, bias=True)
+        (transformer_encoder): TransformerEncoder(
+          (layers): ModuleList(
+            (0): TransformerEncoderLayer(
+              (self_attn): MultiheadAttention(
+                (out_proj): NonDynamicallyQuantizableLinear(in_features=128, out_features=128, bias=True)
+              )
+              (linear1): Linear(in_features=128, out_features=512, bias=True)
+              (dropout): Dropout(p=0.0, inplace=False)
+              (linear2): Linear(in_features=512, out_features=128, bias=True)
+              (norm1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (norm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (dropout1): Dropout(p=0.0, inplace=False)
+              (dropout2): Dropout(p=0.0, inplace=False)
+            )
+          )
+        )
+        (lin_out): Linear(in_features=128, out_features=48, bias=True)
+      )
+    )
+    (36): circular_shift()
+    (37-38): 2 x RQS_coupling_block(
+      (network): parameter_equivariant_network(
+        (lin_in): Linear(in_features=16, out_features=128, bias=True)
+        (transformer_encoder): TransformerEncoder(
+          (layers): ModuleList(
+            (0): TransformerEncoderLayer(
+              (self_attn): MultiheadAttention(
+                (out_proj): NonDynamicallyQuantizableLinear(in_features=128, out_features=128, bias=True)
+              )
+              (linear1): Linear(in_features=128, out_features=512, bias=True)
+              (dropout): Dropout(p=0.0, inplace=False)
+              (linear2): Linear(in_features=512, out_features=128, bias=True)
+              (norm1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (norm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (dropout1): Dropout(p=0.0, inplace=False)
+              (dropout2): Dropout(p=0.0, inplace=False)
+            )
+          )
+        )
+        (lin_out): Linear(in_features=128, out_features=48, bias=True)
+      )
+    )
+    (39): circular_shift()
+    (40-41): 2 x RQS_coupling_block(
+      (network): parameter_equivariant_network(
+        (lin_in): Linear(in_features=16, out_features=128, bias=True)
+        (transformer_encoder): TransformerEncoder(
+          (layers): ModuleList(
+            (0): TransformerEncoderLayer(
+              (self_attn): MultiheadAttention(
+                (out_proj): NonDynamicallyQuantizableLinear(in_features=128, out_features=128, bias=True)
+              )
+              (linear1): Linear(in_features=128, out_features=512, bias=True)
+              (dropout): Dropout(p=0.0, inplace=False)
+              (linear2): Linear(in_features=512, out_features=128, bias=True)
+              (norm1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (norm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (dropout1): Dropout(p=0.0, inplace=False)
+              (dropout2): Dropout(p=0.0, inplace=False)
+            )
+          )
+        )
+        (lin_out): Linear(in_features=128, out_features=48, bias=True)
+      )
+    )
+    (42): circular_shift()
+    (43-44): 2 x RQS_coupling_block(
+      (network): parameter_equivariant_network(
+        (lin_in): Linear(in_features=16, out_features=128, bias=True)
+        (transformer_encoder): TransformerEncoder(
+          (layers): ModuleList(
+            (0): TransformerEncoderLayer(
+              (self_attn): MultiheadAttention(
+                (out_proj): NonDynamicallyQuantizableLinear(in_features=128, out_features=128, bias=True)
+              )
+              (linear1): Linear(in_features=128, out_features=512, bias=True)
+              (dropout): Dropout(p=0.0, inplace=False)
+              (linear2): Linear(in_features=512, out_features=128, bias=True)
+              (norm1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (norm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (dropout1): Dropout(p=0.0, inplace=False)
+              (dropout2): Dropout(p=0.0, inplace=False)
+            )
+          )
+        )
+        (lin_out): Linear(in_features=128, out_features=48, bias=True)
+      )
+    )
+    (45): circular_shift()
+    (46-47): 2 x RQS_coupling_block(
+      (network): parameter_equivariant_network(
+        (lin_in): Linear(in_features=16, out_features=128, bias=True)
+        (transformer_encoder): TransformerEncoder(
+          (layers): ModuleList(
+            (0): TransformerEncoderLayer(
+              (self_attn): MultiheadAttention(
+                (out_proj): NonDynamicallyQuantizableLinear(in_features=128, out_features=128, bias=True)
+              )
+              (linear1): Linear(in_features=128, out_features=512, bias=True)
+              (dropout): Dropout(p=0.0, inplace=False)
+              (linear2): Linear(in_features=512, out_features=128, bias=True)
+              (norm1): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (norm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+              (dropout1): Dropout(p=0.0, inplace=False)
+              (dropout2): Dropout(p=0.0, inplace=False)
+            )
+          )
+        )
+        (lin_out): Linear(in_features=128, out_features=48, bias=True)
+      )
+    )
+  )
+)
+
