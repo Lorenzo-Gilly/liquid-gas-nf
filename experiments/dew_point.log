@@ -1,0 +1,63 @@
+=================================================================
+2D LJ dew-point scan
+  N=128  D=2  ρ*=0.08  L=40.000σ
+  T* sweep: [0.4, 0.41, 0.42, 0.43, 0.44, 0.45, 0.47]
+  4 gas-init chains per temperature
+  300K equil + 300K production  (chunk=5000)
+  Cluster r_cut = 1.5σ   |   LJ cutoff = 2.5σ
+  Output: experiments/dew_point
+=================================================================
+
+Calibrating step size at T*=0.43 (gas init) ...
+  step_size = 2.000σ   acceptance rates: 0.50→0.772  1.00→0.586  1.50→0.521  2.00→0.472
+
+── T*=0.40 ──────────────────────────
+  Equilibrating 300K moves ... done.  OP after equil = 0.309
+  Production 300K moves: 60k 120k 180k 240k 300k done.
+  ⟨U/N⟩=-1.0497   ⟨OP⟩=0.3338   ⟨n_clusters⟩≈33.2
+
+── T*=0.41 ──────────────────────────
+  Equilibrating 300K moves ... done.  OP after equil = 0.258
+  Production 300K moves: 60k 120k 180k 240k 300k done.
+  ⟨U/N⟩=-0.9481   ⟨OP⟩=0.3064   ⟨n_clusters⟩≈39.2
+
+── T*=0.42 ──────────────────────────
+  Equilibrating 300K moves ... done.  OP after equil = 0.273
+  Production 300K moves: 60k 120k 180k 240k 300k done.
+  ⟨U/N⟩=-0.9094   ⟨OP⟩=0.3010   ⟨n_clusters⟩≈39.2
+
+── T*=0.43 ──────────────────────────
+  Equilibrating 300K moves ... done.  OP after equil = 0.373
+  Production 300K moves: 60k 120k 180k 240k 300k done.
+  ⟨U/N⟩=-0.8522   ⟨OP⟩=0.3185   ⟨n_clusters⟩≈42.5
+
+── T*=0.44 ──────────────────────────
+  Equilibrating 300K moves ... done.  OP after equil = 0.266
+  Production 300K moves: 60k 120k 180k 240k 300k done.
+  ⟨U/N⟩=-0.7590   ⟨OP⟩=0.2427   ⟨n_clusters⟩≈48.2
+
+── T*=0.45 ──────────────────────────
+  Equilibrating 300K moves ... done.  OP after equil = 0.121
+  Production 300K moves: 60k 120k 180k 240k 300k done.
+  ⟨U/N⟩=-0.6657   ⟨OP⟩=0.1682   ⟨n_clusters⟩≈54.0
+
+── T*=0.47 ──────────────────────────
+  Equilibrating 300K moves ... done.  OP after equil = 0.146
+  Production 300K moves: 60k 120k 180k 240k 300k done.
+  ⟨U/N⟩=-0.5773   ⟨OP⟩=0.1206   ⟨n_clusters⟩≈57.8
+Saved: experiments/dew_point/summary.png
+
+============================================================
+     T*       ⟨U/N⟩       ⟨OP⟩    ⟨n_clusters⟩
+  --------------------------------------------------------
+   0.40     -1.0497     0.3338            33.2  ← DROPLET
+   0.41     -0.9481     0.3064            39.2  ← DROPLET
+   0.42     -0.9094     0.3010            39.2  ← DROPLET
+   0.43     -0.8522     0.3185            42.5  ← DROPLET
+   0.44     -0.7590     0.2427            48.2  ← DROPLET
+   0.45     -0.6657     0.1682            54.0  ← DROPLET
+   0.47     -0.5773     0.1206            57.8  ← DROPLET
+============================================================
+
+Saved: experiments/dew_point/results.csv
+Dew-point scan complete.

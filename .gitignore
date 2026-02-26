@@ -14,8 +14,10 @@ env/
 # Data files (large binaries — transfer separately via scp/rsync)
 data/
 
-# Training checkpoints and logs (large .pkl files)
-experiments/
+# Large binary checkpoints inside experiments (track results, not weights)
+experiments/**/*.pkl
+experiments/**/*.pt
+experiments/**/*.pth
 
 # Generated plots
 plots/*.png
